@@ -1,0 +1,5 @@
+# Logs and temp files
+server.log
+
+# Environment/Sensitive data (if cookies.txt is considered sensitive/generated)
+cookies.txt

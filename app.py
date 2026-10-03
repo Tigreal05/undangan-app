@@ -1,11 +1,150 @@
 import os
+import re
+import html as html_lib
 import sqlite3
+import hashlib
+import hmac
+import secrets
+import base64
+import time
+import mimetypes
+from urllib.parse import quote as urlquote
 import aiohttp
 from aiohttp import web
 
 DB_NAME = "undangan.db"
 UPLOAD_DIR = "./static_uploads"
 HOMEPAGE_FILE = "homepage.html"
+
+# ============================================================
+# S0 SECURITY: konfigurasi via environment variable
+#   ADMIN_USERNAME     (default: admin)
+#   ADMIN_PASSWORD     (WAJIB diisi di produksi; jika kosong ->
+#                       dibuat password acak & dicetak ke log saat startup)
+#   SESSION_SECRET     (random secret utk cookie signing; jika kosong ->
+#                       digenerate acak tiap start = session hilang saat restart)
+#   ALLOW_INSECURE_COOKIE (=1 hanya utk dev lokal tanpa HTTPS;
+#                       default 0 => cookie Secure => wajib HTTPS di Railway)
+# ============================================================
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "").encode() or secrets.token_bytes(32)
+ALLOW_INSECURE_COOKIE = os.environ.get("ALLOW_INSECURE_COOKIE", "0") == "1"
+
+PBKDF2_ITERATIONS = 200_000
+SESSION_MAX_AGE = 8 * 3600          # 8 jam
+LOGIN_WINDOW_SECONDS = 900          # 15 menit
+LOGIN_MAX_ATTEMPTS = 5              # maks 5 percobaan / IP / window
+CSRF_MAX_AGE = 3600                 # token CSRF berlaku 1 jam
+
+# Whitelist upload media (perluasan dari perilaku lama, tetap aman)
+ALLOWED_UPLOAD_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf"}
+ALLOWED_UPLOAD_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"}
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+
+def _escape(value):
+    """Escape nilai dinamis sebelum masuk HTML."""
+    return html_lib.escape("" if value is None else str(value), quote=True)
+
+def hash_password(password, salt=None):
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return base64.b64encode(salt).decode() + "$" + base64.b64encode(dk).decode()
+
+def verify_password(password, stored):
+    try:
+        salt_b64, hash_b64 = stored.split("$", 1)
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(hash_b64)
+    except Exception:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return hmac.compare_digest(actual, expected)
+
+def make_session_token(admin_id, username):
+    payload = "%d|%s|%d" % (admin_id, username, int(time.time()) + SESSION_MAX_AGE)
+    sig = hmac.new(SESSION_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+    return payload + "." + sig
+
+def read_session_token(token):
+    """Validasi signature + expiry. Return dict admin atau None."""
+    try:
+        payload, sig = token.rsplit(".", 1)
+        if not hmac.compare_digest(sig, hmac.new(SESSION_SECRET, payload.encode(), hashlib.sha256).hexdigest()):
+            return None
+        aid_s, uname, exp_s = payload.split("|")
+        if int(exp_s) < int(time.time()):
+            return None
+        return {"id": int(aid_s), "username": uname}
+    except Exception:
+        return None
+
+def make_csrf_token(admin_id):
+    ts = int(time.time())
+    msg = "%d|%d" % (admin_id, ts)
+    sig = hmac.new(SESSION_SECRET, ("csrf:" + msg).encode(), hashlib.sha256).hexdigest()
+    return msg + "." + sig
+
+def check_csrf_token(admin_id, token):
+    try:
+        msg, sig = token.rsplit(".", 1)
+        aid_s, ts_s = msg.split("|")
+        if int(ts_s) + CSRF_MAX_AGE < int(time.time()):
+            return False
+        if int(aid_s) != int(admin_id):
+            return False
+        return hmac.compare_digest(sig, hmac.new(SESSION_SECRET, ("csrf:" + msg).encode(), hashlib.sha256).hexdigest())
+    except Exception:
+        return False
+
+def get_admin(request):
+    return request.get("_current_admin")
+
+def csrf_field(request):
+    adm = get_admin(request)
+    token = make_csrf_token(adm["id"]) if adm else ""
+    return '<input type="hidden" name="csrf_token" value="%s">' % _escape(token)
+
+@web.middleware
+async def security_middleware(request, handler):
+    # 1) Proteksi SEMUA route /admin* (GET maupun POST) — tidak bisa lagi
+    #    dilewati dengan mengakses URL/POST langsung seperti sebelumnya.
+    if request.path.startswith("/admin"):
+        token = request.cookies.get("admin_session")
+        admin = read_session_token(token) if token else None
+        if admin is None:
+            if request.path == "/admin/login":
+                pass  # ditangani handler login di bawah
+            else:
+                raise web.HTTPFound("/admin/login")
+        request["_current_admin"] = admin
+        # 2) Semua mutation POST admin wajib membawa CSRF token yang valid.
+        if request.method == "POST" and request.path != "/admin/login":
+            content_type = request.headers.get("Content-Type", "")
+            if content_type.startswith("multipart/form-data"):
+                # Upload file: jangan konsumsi body di sini (nanti dibaca
+                # handler via request.multipart()); CSRF divalidasi handler.
+                return await handler(request)
+            form = await request.post()
+            if not check_csrf_token(admin["id"], form.get("csrf_token", "")):
+                raise web.HTTPForbidden(text="CSRF token tidak valid. Silakan login ulang.")
+    return await handler(request)
+
+# ---- rate limiter login sederhana in-memory (per IP) ----
+_login_attempts = {}
+
+def login_rate_limited(ip):
+    now = time.time()
+    entries = [t for t in _login_attempts.get(ip, []) if now - t < LOGIN_WINDOW_SECONDS]
+    _login_attempts[ip] = entries
+    return len(entries) >= LOGIN_MAX_ATTEMPTS
+
+def record_login_attempt(ip):
+    _login_attempts.setdefault(ip, []).append(time.time())
+
+def clear_login_attempts(ip):
+    _login_attempts.pop(ip, None)
 
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
@@ -58,6 +197,19 @@ def init_db():
             uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+
+    # S0 SECURITY: akun admin sungguhan (menggantikan PIN client-side "110202")
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS admin_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'superadmin',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP
+        )
+    ''')
     
     cursor.execute("PRAGMA table_info(templates)")
     columns = [col[1] for col in cursor.fetchall()]
@@ -92,9 +244,37 @@ def init_db():
         cursor.executemany('INSERT INTO templates (package_id, name, price, discount, duration, image_url, html_code, is_top10) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', initial_tmpls)
         conn.commit()
 
+    # S0 SECURITY: pastikan ada minimal 1 akun admin.
+    # Password diambil dari env ADMIN_PASSWORD; jika kosong -> digenerate acak
+    # dan dicetak sekali ke log startup (tidak pernah disimpan plaintext).
+    global _BOOT_ADMIN_HINT
+    cursor.execute("SELECT COUNT(*) FROM admin_users")
+    if cursor.fetchone()[0] == 0:
+        pwd = ADMIN_PASSWORD or secrets.token_urlsafe(9)
+        cursor.execute('INSERT INTO admin_users (username, password_hash, role) VALUES (?, ?, ?)',
+                       (ADMIN_USERNAME, hash_password(pwd), 'superadmin'))
+        conn.commit()
+        if not ADMIN_PASSWORD:
+            _BOOT_ADMIN_HINT = ("ADMIN login dibuat otomatis -> username: %s | password sementara: %s"
+                                % (ADMIN_USERNAME, pwd))
+    else:
+        if ADMIN_PASSWORD:
+            cursor.execute('UPDATE admin_users SET password_hash = ? WHERE username = ?',
+                           (hash_password(ADMIN_PASSWORD), ADMIN_USERNAME))
+            conn.commit()
+        cursor.execute("SELECT username FROM admin_users LIMIT 1")
+        row = cursor.fetchone()
+        _BOOT_ADMIN_HINT = None if row else "Tidak ada akun admin di database!"
     conn.close()
 
+_BOOT_ADMIN_HINT = None
 init_db()
+
+if _BOOT_ADMIN_HINT:
+    print("=" * 60)
+    print("[S0][SECURITY]", _BOOT_ADMIN_HINT)
+    print("[S0][SECURITY] Segera ganti via env ADMIN_PASSWORD atau fitur ganti password.")
+    print("=" * 60)
 
 BASE_HEAD = """
     <meta charset="UTF-8">
@@ -153,13 +333,12 @@ FOOTER_HTML = """
 
 ADMIN_SECURITY_SCRIPT = """
     <script>
+        // S0 SECURITY: PIN client-side "110202" telah DIHAPUS dari kode.
+        // Admin kini dilindungi login server-side di /admin/login
+        // (session cookie HttpOnly + CSRF + rate-limit). Tombol footer
+        // cukup mengarahkan ke halaman login; autentikasi terjadi di server.
         function accessAdmin() {
-            const pin = prompt("Masukkan PIN Keamanan Admin:");
-            if (pin === "110202") {
-                window.location.href = "/admin";
-            } else if (pin !== null) {
-                alert("PIN Salah! Akses ditolak.");
-            }
+            window.location.href = "/admin/login";
         }
         function toggleMenu() {
             var menu = document.getElementById("menuDropdown");
@@ -173,6 +352,92 @@ ADMIN_SECURITY_SCRIPT = """
         }
     </script>
 """
+
+LOGIN_PAGE_HTML = """<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login Admin - SUKA MOTO</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Plus Jakarta Sans',sans-serif}
+body{background:#09090b;color:#f4f4f5;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
+.card{width:100%;max-width:360px;background:#121215;border:1px solid #27272a;border-radius:14px;padding:28px}
+.brand-main{font-size:16px;font-weight:800;color:#fff;letter-spacing:1px;text-align:center}
+.brand-sub{font-size:13px;color:#fbbf24;text-align:center;margin-bottom:20px}
+.err{background:#7f1d1d;color:#fecaca;font-size:12px;padding:10px 12px;border-radius:8px;margin-bottom:14px}
+label{font-size:11px;color:#a1a1aa;display:block;margin-top:10px}
+input{width:100%;padding:11px 12px;margin-top:4px;border-radius:8px;border:1px solid #3f3f46;background:#18181b;color:#fff;font-size:14px}
+button{width:100%;margin-top:18px;padding:12px;border:none;border-radius:8px;background:#fbbf24;color:#000;font-weight:800;font-size:14px;cursor:pointer}
+.back{display:block;text-align:center;margin-top:16px;font-size:11px;color:#71717a;text-decoration:none}
+.lock{text-align:center;font-size:26px;color:#fbbf24;margin-bottom:10px}
+</style>
+</head>
+<body>
+<div class="card">
+<div class="lock">&#128274;</div>
+<div class="brand-main">SUKA MOTO</div>
+<div class="brand-sub">Admin Control &mdash; akses terbatas</div>
+__ERROR_BLOCK__
+<form action="/admin/login" method="POST" autocomplete="off">
+<label>Username</label>
+<input type="text" name="username" required maxlength="50">
+<label>Password</label>
+<input type="password" name="password" required maxlength="200">
+<button type="submit">Masuk</button>
+</form>
+<a href="/" class="back">&larr; Kembali ke Beranda</a>
+</div>
+</body>
+</html>"""
+
+async def handle_admin_login(request):
+    error = request.query.get('error', '')
+    msg_map = {
+        'invalid': 'Username atau password salah.',
+        'rate': 'Terlalu banyak percobaan gagal. Coba lagi dalam 15 menit.',
+        'inactive': 'Akun dinonaktifkan.',
+    }
+    err_html = ('<div class="err">%s</div>' % _escape(msg_map.get(error, 'Kredensial tidak valid.'))) if error else ''
+    page = LOGIN_PAGE_HTML.replace('__ERROR_BLOCK__', err_html)
+    return web.Response(text=page, content_type='text/html')
+
+async def handle_admin_login_post(request):
+    ip = request.remote or 'unknown'
+    if login_rate_limited(ip):
+        raise web.HTTPFound('/admin/login?error=rate')
+    data = await request.post()
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, username, password_hash, is_active FROM admin_users WHERE username = ?', (username,))
+    row = cursor.fetchone()
+    ok = bool(row) and row[3] == 1 and verify_password(password, row[2])
+    if ok:
+        clear_login_attempts(ip)
+        cursor.execute('UPDATE admin_users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (row[0],))
+        conn.commit()
+        conn.close()
+        resp = web.HTTPFound('/admin')
+        resp.set_cookie(
+            'admin_session',
+            make_session_token(row[0], row[1]),
+            max_age=SESSION_MAX_AGE,
+            httponly=True,
+            samesite='Strict',
+            secure=not ALLOW_INSECURE_COOKIE,
+            path='/',
+        )
+        raise resp
+    conn.close()
+    record_login_attempt(ip)
+    raise web.HTTPFound('/admin/login?error=invalid')
+
+async def handle_admin_logout(request):
+    resp = web.HTTPFound('/admin/login')
+    resp.del_cookie('admin_session', path='/')
+    raise resp
 
 async def handle_index(request):
     conn = sqlite3.connect(DB_NAME)
@@ -706,6 +971,8 @@ async def handle_admin(request):
             current_homepage_html = f.read()
     else:
         current_homepage_html = ""
+    # S0 SECURITY: escape saat masuk <textarea> (file disimpan apa adanya).
+    current_homepage_esc = _escape(current_homepage_html)
 
     pkg_options = ""
     for pid, pname, _ in pkgs:
@@ -715,10 +982,11 @@ async def handle_admin(request):
     for pid, name, sub in pkgs:
         pkg_rows += f"""
         <tr style="border-bottom:1px solid #27272a;">
-            <td style="padding:10px; font-weight:bold;">{name}</td>
-            <td style="padding:10px; color:#a1a1aa;">{sub}</td>
+            <td style="padding:10px; font-weight:bold;">{_escape(name)}</td>
+            <td style="padding:10px; color:#a1a1aa;">{_escape(sub)}</td>
             <td style="padding:10px;">
                 <form action="/admin/delete_pkg" method="POST" style="display:inline;">
+                    {csrf_field(request)}
                     <input type="hidden" name="id" value="{pid}">
                     <button type="submit" style="background:#ef4444; color:#fff; border:none; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:10px;">Hapus</button>
                 </form>
@@ -729,13 +997,14 @@ async def handle_admin(request):
     tmpl_rows = ""
     for tid, tname, tprice, pname, tdisc, tdur, top10 in tmpls:
         top_badge = "<span style='background:#34d399; color:#000; padding:1px 4px; border-radius:3px; font-size:8px; font-weight:bold;'>Top 10</span>" if top10 else ""
-        extra_info = f"<br><span style='font-size:9px; color:#fbbf24;'>{tdisc} | {tdur} {top_badge}</span>" if (tdisc or tdur or top10) else ""
+        extra_info = f"<br><span style='font-size:9px; color:#fbbf24;'>{_escape(tdisc)} | {_escape(tdur)} {top_badge}</span>" if (tdisc or tdur or top10) else ""
         tmpl_rows += f"""
         <tr style="border-bottom:1px solid #27272a;">
-            <td style="padding:10px; font-weight:bold;">{tname} {extra_info}<br><span style="font-size:9px; color:#71717a;">Paket: {pname}</span></td>
-            <td style="padding:10px; color:#34d399; font-weight:bold;">{tprice}</td>
+            <td style="padding:10px; font-weight:bold;">{_escape(tname)} {extra_info}<br><span style="font-size:9px; color:#71717a;">Paket: {_escape(pname)}</span></td>
+            <td style="padding:10px; color:#34d399; font-weight:bold;">{_escape(tprice)}</td>
             <td style="padding:10px;">
                 <form action="/admin/delete_tmpl" method="POST" style="display:inline;">
+                    {csrf_field(request)}
                     <input type="hidden" name="id" value="{tid}">
                     <button type="submit" style="background:#ef4444; color:#fff; border:none; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:10px;">Hapus</button>
                 </form>
@@ -745,16 +1014,17 @@ async def handle_admin(request):
 
     media_rows = ""
     for mid, mname, mpath in media_files:
-        full_url = f"/static_uploads/{mname}"
+        full_url = "/static_uploads/" + urlquote(mname)
         media_rows += f"""
         <tr style="border-bottom:1px solid #27272a;">
             <td style="padding:8px; word-break:break-all;">
-                <a href="{full_url}" target="_blank" style="color:#34d399; text-decoration:none; display:block; margin-bottom:4px;">{mname}</a>
-                <input type="text" readonly value="" class="auto-full-url" data-url="{full_url}" onclick="this.select();" style="font-size:10px; padding:4px 6px; background:#121215; border:1px solid #3f3f46; color:#fbbf24; border-radius:4px; width:100%;">
+                <a href="{_escape(full_url)}" target="_blank" style="color:#34d399; text-decoration:none; display:block; margin-bottom:4px;">{_escape(mname)}</a>
+                <input type="text" readonly value="" class="auto-full-url" data-url="{_escape(full_url)}" onclick="this.select();" style="font-size:10px; padding:4px 6px; background:#121215; border:1px solid #3f3f46; color:#fbbf24; border-radius:4px; width:100%;">
             </td>
             <td style="padding:8px; text-align:right; white-space:nowrap; vertical-align:top;">
                 <button type="button" onclick="navigator.clipboard.writeText(this.closest('tr').querySelector('.auto-full-url').value).then(() => {{ alert('Link aset berhasil disalin!'); }});" style="background:#27272a; color:#fbbf24; border:none; padding:4px 8px; border-radius:4px; font-size:9px; cursor:pointer; font-weight:bold;">Copy</button>
                 <form action="/admin/delete_media" method="POST" style="display:inline;">
+                    {csrf_field(request)}
                     <input type="hidden" name="id" value="{mid}">
                     <button type="submit" style="background:#ef4444; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:9px; cursor:pointer; margin-left:4px;">Hapus</button>
                 </form>
@@ -787,13 +1057,18 @@ async def handle_admin(request):
     <body>
         <div class="wrap">
             <h2 style="font-size: 16px; margin-bottom: 5px;">Panel Kontrol Admin</h2>
-            <p style="font-size:11px; color:#a1a1aa; margin-bottom:20px;"><a href="/" style="color:#fbbf24; text-decoration:none;">&larr; Kembali ke Beranda</a></p>
-            
+            <p style="font-size:11px; color:#a1a1aa; margin-bottom:20px;">
+                <a href="/" style="color:#fbbf24; text-decoration:none;">&larr; Kembali ke Beranda</a>
+                &nbsp;|&nbsp; Login sebagai: <b style="color:#34d399;">{_escape((get_admin(request) or {}).get('username', ''))}</b>
+                &nbsp;|&nbsp; <a href="/admin/logout" style="color:#ef4444; text-decoration:none;">Logout</a>
+            </p>
+
             <div class="section-box">
                 <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">Edit File Fisik Halaman Beranda (homepage.html)</h3>
                 <form action="/admin/update_homepage" method="POST">
+                    {csrf_field(request)}
                     <label style="font-size: 11px; color: #a1a1aa; display:block; margin-top:4px;">Isi file homepage.html:</label>
-                    <textarea name="homepage_html" required style="height:120px;">{current_homepage_html}</textarea>
+                    <textarea name="homepage_html" required style="height:120px;">{current_homepage_esc}</textarea>
                     <button type="submit" class="btn-save">Simpan ke File homepage.html</button>
                 </form>
             </div>
@@ -801,8 +1076,10 @@ async def handle_admin(request):
             <div class="section-box">
                 <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">File Manager (Asset Hosting)</h3>
                 <form action="/admin/upload_media" method="POST" enctype="multipart/form-data">
+                    {csrf_field(request)}
                     <label style="font-size: 11px; color: #a1a1aa; display:block;">Upload File / Gambar Aset:</label>
-                    <input type="file" name="file" required style="background:#121215; padding:6px;">
+                    <input type="file" name="file" required accept=".jpg,.jpeg,.png,.gif,.webp,.pdf" style="background:#121215; padding:6px;">
+                    <small style="font-size:10px; color:#71717a;">Format diizinkan: jpg, jpeg, png, gif, webp, pdf — maks 5 MB.</small>
                     <button type="submit" class="btn-save">Upload & Dapatkan Link</button>
                 </form>
                 <h4 style="font-size:11px; margin-top:15px; color:#a1a1aa; margin-bottom:5px;">Daya Simpan Aset (Copy Link):</h4>
@@ -815,6 +1092,7 @@ async def handle_admin(request):
             <div class="section-box">
                 <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">Tambah Paket Utama</h3>
                 <form action="/admin/add_pkg" method="POST">
+                    {csrf_field(request)}
                     <input type="text" name="name" placeholder="Nama Paket (Contoh: Platinum VIP)" required>
                     <input type="text" name="subtitle" placeholder="Subjudul (Contoh: All-in-One Exclusive)" required>
                     <input type="text" name="image_url" placeholder="URL Gambar Cover Card" value="https://images.unsplash.com/photo-1519741497674-611481863552?auto=format&fit=crop&w=600&q=80" required>
@@ -830,6 +1108,7 @@ async def handle_admin(request):
             <div class="section-box">
                 <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">Tambah Template & Kodingan HTML</h3>
                 <form action="/admin/add_tmpl" method="POST">
+                    {csrf_field(request)}
                     <select name="package_id" required>
                         <option value="">-- Pilih Kategori Paket --</option>
                         {pkg_options}
@@ -872,23 +1151,71 @@ async def handle_update_homepage(request):
     raise web.HTTPFound('/admin')
 
 async def handle_upload_media(request):
+    # S0 SECURITY: perbaikan path traversal + validasi tipe/ukuran file.
+    admin = get_admin(request)  # middleware melewatkan multipart tanpa cek CSRF,
+                                # jadi validasi CSRF dilakukan di sini.
     reader = await request.multipart()
+    csrf_ok = False
     field = await reader.next()
+    error = ""
+    saved_name = None
+    while field is not None:
+        if field.name == "csrf_token":
+            val = (await field.read(decode=True)).decode("utf-8", "replace")
+            csrf_ok = check_csrf_token(admin["id"], val)
+            field = await reader.next()
+        elif field.name == "file":
+            break  # field file ketemu; hentikan iterasi
+        else:
+            field = await reader.next()
+    if not csrf_ok:
+        raise web.HTTPForbidden(text="CSRF token tidak valid. Silakan login ulang.")
     if field and field.filename:
-        filename = field.filename
-        filepath = os.path.join(UPLOAD_DIR, filename)
-        with open(filepath, 'wb') as f:
-            while True:
-                chunk = await field.read_chunk()
-                if not chunk:
-                    break
-                f.write(chunk)
-        
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute('INSERT INTO media_uploads (filename, filepath) VALUES (?, ?)', (filename, filepath))
-        conn.commit()
-        conn.close()
+        original = os.path.basename(field.filename)  # buang semua komponen path ../
+        ext = os.path.splitext(original)[1].lower()
+        if ext not in ALLOWED_UPLOAD_EXTS:
+            error = "badtype"
+        else:
+            declared = (field.headers.get("Content-Type") if field.headers else "") or ""
+            guessed = mimetypes.guess_type(original)[0] or ""
+            content_type = declared.split(";")[0].strip().lower()
+            if content_type and content_type not in ALLOWED_UPLOAD_MIMES:
+                error = "badmime"
+            elif guessed and guessed not in ALLOWED_UPLOAD_MIMES:
+                error = "badmime"
+            else:
+                safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", os.path.splitext(original)[0])[:60] or "file"
+                saved_name = "%s_%d%s" % (safe_stem, int(time.time() * 1000), ext)
+                filepath = os.path.join(UPLOAD_DIR, saved_name)
+                size = 0
+                oversize = False
+                with open(filepath, 'wb') as f:
+                    while True:
+                        chunk = await field.read_chunk()
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_UPLOAD_BYTES:
+                            oversize = True
+                            break
+                        f.write(chunk)
+                if oversize or size == 0:
+                    try:
+                        os.remove(filepath)
+                    except OSError:
+                        pass
+                    saved_name = None
+                    error = "oversize" if oversize else "empty"
+                else:
+                    conn = sqlite3.connect(DB_NAME)
+                    cursor = conn.cursor()
+                    # filename = nama tersimpan yang aman; filepath mengikuti pola lama
+                    cursor.execute('INSERT INTO media_uploads (filename, filepath) VALUES (?, ?)',
+                                   (saved_name, os.path.join(UPLOAD_DIR, saved_name)))
+                    conn.commit()
+                    conn.close()
+    if error:
+        raise web.HTTPFound('/admin?upload_error=' + error)
     raise web.HTTPFound('/admin')
 
 async def handle_delete_media(request):
@@ -900,8 +1227,11 @@ async def handle_delete_media(request):
         cursor.execute('SELECT filename FROM media_uploads WHERE id = ?', (mid,))
         res = cursor.fetchone()
         if res:
-            fpath = os.path.join(UPLOAD_DIR, res[0])
-            if os.path.exists(fpath):
+            # S0 SECURITY: cegah path traversal saat penghapusan file.
+            safe_name = os.path.basename(res[0])
+            fpath = os.path.realpath(os.path.join(UPLOAD_DIR, safe_name))
+            upload_root = os.path.realpath(UPLOAD_DIR)
+            if fpath.startswith(upload_root + os.sep) and os.path.isfile(fpath):
                 os.remove(fpath)
             cursor.execute('DELETE FROM media_uploads WHERE id = ?', (mid,))
             conn.commit()
@@ -963,7 +1293,7 @@ async def handle_delete_tmpl(request):
         conn.close()
     raise web.HTTPFound('/admin')
 
-app = web.Application()
+app = web.Application(middlewares=[security_middleware])
 app.router.app_get = app.router.add_get # fallback safety
 app.router.add_get('/', handle_index)
 app.router.add_get('/templates', handle_templates)
@@ -972,10 +1302,17 @@ app.router.add_get('/demo', handle_demo)
 app.router.add_get('/editor', handle_editor)
 app.router.add_get('/checkout', handle_checkout)
 app.router.add_get('/guestbook', handle_guestbook)
+
+# S0 SECURITY: autentikasi admin server-side (menggantikan PIN client-side)
+app.router.add_get('/admin/login', handle_admin_login)
+app.router.add_post('/admin/login', handle_admin_login_post)
+app.router.add_get('/admin/logout', handle_admin_logout)
 app.router.add_get('/admin', handle_admin)
 
 app.router.add_static('/static_uploads/', path=UPLOAD_DIR, name='static_uploads')
 
+# Semua endpoint POST /admin/* kini diproteksi security_middleware:
+# wajib session cookie valid + CSRF token.
 app.router.add_post('/admin/update_homepage', handle_update_homepage)
 app.router.add_post('/admin/upload_media', handle_upload_media)
 app.router.add_post('/admin/delete_media', handle_delete_media)
