@@ -1,0 +1,195 @@
+
+    <!DOCTYPE html>
+    <html lang="id">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Admin Dashboard - SUKA MOTO</title>
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; font-family: sans-serif; }
+            body { background: #09090b; color: #f4f4f5; padding: 16px; }
+            .wrap { max-width: 600px; margin: 0 auto; background: #121215; padding: 20px; border-radius: 12px; border: 1px solid #27272a; }
+            input, select, textarea, button { padding: 10px 12px; margin: 6px 0; border-radius: 8px; border: 1px solid #3f3f46; background: #18181b; color: #fff; width: 100%; font-size: 13px; }
+            textarea { resize: vertical; height: 100px; font-family: monospace; font-size: 11px; }
+            .btn-save { background: #fbbf24; color: #000; font-weight: bold; cursor: pointer; border: none; margin-top: 10px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+            th { text-align: left; padding: 10px; border-bottom: 2px solid #3f3f46; color: #fbbf24; }
+            .section-box { background: #18181b; border: 1px solid #27272a; padding: 15px; border-radius: 10px; margin-bottom: 20px; }
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <h2 style="font-size: 16px; margin-bottom: 5px;">Panel Kontrol Admin</h2>
+            <p style="font-size:11px; color:#a1a1aa; margin-bottom:20px;">
+                <a href="/" style="color:#fbbf24; text-decoration:none;">&larr; Kembali ke Beranda</a>
+                &nbsp;|&nbsp; Login sebagai: <b style="color:#34d399;">admin</b>
+                &nbsp;|&nbsp; <a href="/admin/logout" style="color:#ef4444; text-decoration:none;">Logout</a>
+            </p>
+
+            <div class="section-box">
+                <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">Edit File Fisik Halaman Beranda (homepage.html)</h3>
+                <form action="/admin/update_homepage" method="POST">
+                    <input type="hidden" name="csrf_token" value="1|1791041218.a860e24a3b8bc44792984f60bd9e2b32158b5eb4872d3fd113f08264b38d8e08">
+                    <label style="font-size: 11px; color: #a1a1aa; display:block; margin-top:4px;">Isi file homepage.html:</label>
+                    <textarea name="homepage_html" required style="height:120px;">
+        &lt;div class=&quot;bio-card&quot;&gt;
+            &lt;h4&gt;Visual Storyteller | Portrait &amp; Editorial&lt;/h4&gt;
+            &lt;p&gt;Menyediakan jasa pembuatan undangan digital interaktif dan profesional untuk momen spesial Anda.&lt;/p&gt;
+            &lt;div class=&quot;quote&quot;&gt;&quot;Capturing your precious moments with cinematic digital storytelling.&quot;&lt;/div&gt;
+        &lt;/div&gt;
+    </textarea>
+                    <button type="submit" class="btn-save">Simpan ke File homepage.html</button>
+                </form>
+            </div>
+
+            <div class="section-box">
+                <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">File Manager (Asset Hosting)</h3>
+                <form action="/admin/upload_media" method="POST" enctype="multipart/form-data">
+                    <input type="hidden" name="csrf_token" value="1|1791041218.a860e24a3b8bc44792984f60bd9e2b32158b5eb4872d3fd113f08264b38d8e08">
+                    <label style="font-size: 11px; color: #a1a1aa; display:block;">Upload File / Gambar Aset:</label>
+                    <input type="file" name="file" required accept=".jpg,.jpeg,.png,.gif,.webp,.pdf" style="background:#121215; padding:6px;">
+                    <small style="font-size:10px; color:#71717a;">Format diizinkan: jpg, jpeg, png, gif, webp, pdf — maks 5 MB.</small>
+                    <button type="submit" class="btn-save">Upload & Dapatkan Link</button>
+                </form>
+                <h4 style="font-size:11px; margin-top:15px; color:#a1a1aa; margin-bottom:5px;">Daya Simpan Aset (Copy Link):</h4>
+                <table>
+                    <tr><th>Nama File / Link Aset</th><th style="text-align:right;">Aksi</th></tr>
+                    <tr><td colspan='2' style='text-align:center; color:#71717a; padding:10px; font-size:11px;'>Belum ada file di-upload.</td></tr>
+                </table>
+            </div>
+
+            <div class="section-box">
+                <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">Tambah Paket Utama</h3>
+                <form action="/admin/add_pkg" method="POST">
+                    <input type="hidden" name="csrf_token" value="1|1791041218.a860e24a3b8bc44792984f60bd9e2b32158b5eb4872d3fd113f08264b38d8e08">
+                    <input type="text" name="name" placeholder="Nama Paket (Contoh: Platinum VIP)" required>
+                    <input type="text" name="subtitle" placeholder="Subjudul (Contoh: All-in-One Exclusive)" required>
+                    <input type="text" name="image_url" placeholder="URL Gambar Cover Card" value="https://images.unsplash.com/photo-1519741497674-611481863552?auto=format&fit=crop&w=600&q=80" required>
+                    <button type="submit" class="btn-save">Simpan Paket</button>
+                </form>
+                <h4 style="font-size:11px; margin-top:15px; color:#a1a1aa; margin-bottom:5px;">Daftar Paket:</h4>
+                <table>
+                    <tr><th>Paket</th><th>Keterangan</th><th>Aksi</th></tr>
+                    
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:10px; font-weight:bold;">Silver Package</td>
+            <td style="padding:10px; color:#a1a1aa;">Digital Undangan Basic</td>
+            <td style="padding:10px;">
+                <form action="/admin/delete_pkg" method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="1|1791041218.a860e24a3b8bc44792984f60bd9e2b32158b5eb4872d3fd113f08264b38d8e08">
+                    <input type="hidden" name="id" value="1">
+                    <button type="submit" style="background:#ef4444; color:#fff; border:none; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:10px;">Hapus</button>
+                </form>
+            </td>
+        </tr>
+        
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:10px; font-weight:bold;">Gold Package</td>
+            <td style="padding:10px; color:#a1a1aa;">Custom Domain + RSVP</td>
+            <td style="padding:10px;">
+                <form action="/admin/delete_pkg" method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="1|1791041218.a860e24a3b8bc44792984f60bd9e2b32158b5eb4872d3fd113f08264b38d8e08">
+                    <input type="hidden" name="id" value="2">
+                    <button type="submit" style="background:#ef4444; color:#fff; border:none; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:10px;">Hapus</button>
+                </form>
+            </td>
+        </tr>
+        
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:10px; font-weight:bold;">Platinum VIP</td>
+            <td style="padding:10px; color:#a1a1aa;">All-in-One Exclusive</td>
+            <td style="padding:10px;">
+                <form action="/admin/delete_pkg" method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="1|1791041218.a860e24a3b8bc44792984f60bd9e2b32158b5eb4872d3fd113f08264b38d8e08">
+                    <input type="hidden" name="id" value="3">
+                    <button type="submit" style="background:#ef4444; color:#fff; border:none; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:10px;">Hapus</button>
+                </form>
+            </td>
+        </tr>
+        
+                </table>
+            </div>
+
+            <div class="section-box">
+                <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">Tambah Template & Kodingan HTML</h3>
+                <form action="/admin/add_tmpl" method="POST">
+                    <input type="hidden" name="csrf_token" value="1|1791041218.a860e24a3b8bc44792984f60bd9e2b32158b5eb4872d3fd113f08264b38d8e08">
+                    <select name="package_id" required>
+                        <option value="">-- Pilih Kategori Paket --</option>
+                        <option value="1">Silver Package</option><option value="2">Gold Package</option><option value="3">Platinum VIP</option>
+                    </select>
+                    <input type="text" name="name" placeholder="Nama Template (Contoh: Royal Velvet)" required>
+                    <input type="text" name="price" placeholder="Harga (Contoh: Rp 250.000)" required>
+                    <input type="text" name="discount" placeholder="Keterangan Diskon (Cth: Diskon 20%)">
+                    <input type="text" name="duration" placeholder="Durasi Aktif (Cth: Aktif 1 Tahun)">
+                    <div style="display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 12px; color: #fff;">
+                        <input type="checkbox" name="is_top10" value="1" style="width: auto; margin:0;"> Masukkan ke 10 Template Terbaik (Homepage)
+                    </div>
+                    <input type="text" name="image_url" placeholder="URL Gambar Preview Template" value="https://images.unsplash.com/photo-1520854221256-17451cc331bf?auto=format&fit=crop&w=400&q=80" required>
+                    <label style="font-size: 11px; color: #a1a1aa; display:block; margin-top:8px;">Source Code HTML Template:</label>
+                    <textarea name="html_code" placeholder="<!DOCTYPE html>... Paste kodingan HTML undangan web di sini ..." required></textarea>
+                    <button type="submit" class="btn-save">Simpan Template & Kodingan</button>
+                </form>
+                <h4 style="font-size:11px; margin-top:15px; color:#a1a1aa; margin-bottom:5px;">Daftar Template:</h4>
+                <table>
+                    <tr><th>Template / Paket</th><th>Harga</th><th>Aksi</th></tr>
+                    
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:10px; font-weight:bold;">Classic Floral <br><span style='font-size:9px; color:#fbbf24;'>Diskon 10% | Aktif 6 Bulan <span style='background:#34d399; color:#000; padding:1px 4px; border-radius:3px; font-size:8px; font-weight:bold;'>Top 10</span></span><br><span style="font-size:9px; color:#71717a;">Paket: Silver Package</span></td>
+            <td style="padding:10px; color:#34d399; font-weight:bold;">Rp 150.000</td>
+            <td style="padding:10px;">
+                <form action="/admin/delete_tmpl" method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="1|1791041218.a860e24a3b8bc44792984f60bd9e2b32158b5eb4872d3fd113f08264b38d8e08">
+                    <input type="hidden" name="id" value="1">
+                    <button type="submit" style="background:#ef4444; color:#fff; border:none; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:10px;">Hapus</button>
+                </form>
+            </td>
+        </tr>
+        
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:10px; font-weight:bold;">Minimalist Monokrom <br><span style='font-size:9px; color:#fbbf24;'> | Aktif 6 Bulan <span style='background:#34d399; color:#000; padding:1px 4px; border-radius:3px; font-size:8px; font-weight:bold;'>Top 10</span></span><br><span style="font-size:9px; color:#71717a;">Paket: Silver Package</span></td>
+            <td style="padding:10px; color:#34d399; font-weight:bold;">Rp 175.000</td>
+            <td style="padding:10px;">
+                <form action="/admin/delete_tmpl" method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="1|1791041218.a860e24a3b8bc44792984f60bd9e2b32158b5eb4872d3fd113f08264b38d8e08">
+                    <input type="hidden" name="id" value="2">
+                    <button type="submit" style="background:#ef4444; color:#fff; border:none; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:10px;">Hapus</button>
+                </form>
+            </td>
+        </tr>
+        
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:10px; font-weight:bold;">Rustic Wood <br><span style='font-size:9px; color:#fbbf24;'>Promo Launching | Aktif 1 Tahun <span style='background:#34d399; color:#000; padding:1px 4px; border-radius:3px; font-size:8px; font-weight:bold;'>Top 10</span></span><br><span style="font-size:9px; color:#71717a;">Paket: Gold Package</span></td>
+            <td style="padding:10px; color:#34d399; font-weight:bold;">Rp 300.000</td>
+            <td style="padding:10px;">
+                <form action="/admin/delete_tmpl" method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="1|1791041218.a860e24a3b8bc44792984f60bd9e2b32158b5eb4872d3fd113f08264b38d8e08">
+                    <input type="hidden" name="id" value="3">
+                    <button type="submit" style="background:#ef4444; color:#fff; border:none; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:10px;">Hapus</button>
+                </form>
+            </td>
+        </tr>
+        
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:10px; font-weight:bold;">Modern Gold Luxury <br><span style='font-size:9px; color:#fbbf24;'>Best Seller | Aktif Selamanya <span style='background:#34d399; color:#000; padding:1px 4px; border-radius:3px; font-size:8px; font-weight:bold;'>Top 10</span></span><br><span style="font-size:9px; color:#71717a;">Paket: Gold Package</span></td>
+            <td style="padding:10px; color:#34d399; font-weight:bold;">Rp 350.000</td>
+            <td style="padding:10px;">
+                <form action="/admin/delete_tmpl" method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="1|1791041218.a860e24a3b8bc44792984f60bd9e2b32158b5eb4872d3fd113f08264b38d8e08">
+                    <input type="hidden" name="id" value="4">
+                    <button type="submit" style="background:#ef4444; color:#fff; border:none; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:10px;">Hapus</button>
+                </form>
+            </td>
+        </tr>
+        
+                </table>
+            </div>
+        </div>
+        <script>
+            document.querySelectorAll('.auto-full-url').forEach(input => {
+                input.value = window.location.origin + input.getAttribute('data-url');
+            });
+        </script>
+    </body>
+    </html>
+    
