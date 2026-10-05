@@ -6,11 +6,14 @@ Aturan:
   - Kurung kurawal ganda di CSS/JS yang BUKAN key valid TIDAK dianggap placeholder
     (tidak error, dibiarkan apa adanya oleh renderer).
   - Placeholder tidak dikenal -> error (template ditolak saat disimpan/dipreview).
+  - Placeholder EXTRA (opsional) baru aktif sesuai tier paket order (Silver/Gold/Platinum);
+    token {{...}} dari kelompok tier yang TIDAK aktif tetap lolos validasi (direset ""),
+    sehingga satu master template bisa dipakai lintas paket tanpa error.
   - couple_photo harus URL/path asset yang sudah divalidasi server — bukan HTML mentah.
 """
 import re
 
-# Kontrak placeholder (section 4 spesifikasi)
+# Kontrak placeholder inti (section 4 spesifikasi) — selalu aktif di semua tier.
 ALLOWED_KEYS = (
     "groom_name",
     "bride_name",
@@ -20,6 +23,67 @@ ALLOWED_KEYS = (
     "address",
     "couple_photo",
 )
+
+# ---- Placeholder hirarki paket (ADDITIVE V2) -------------------------------
+# Silver: siap pakai, tinggal isi data (layout tidak berubah).
+SILVER_EXTRA_KEYS = (
+    "groom_full_name", "bride_full_name",        # nama lengkap + gelar
+    "groom_parents", "bride_parents",            # nama orang tua
+    "quote_promise",                             # quote/doa
+    "couple_story",                              # cerita singkat / couple story
+    "akkad_date", "akkad_time",                  # tanggal akad
+    "reception_date", "reception_time",          # tanggal resepsi
+    "venue_name", "venue_address",               # nama tempat & alamat
+    "maps_url", "maps_embed_url",                # lokasi di peta
+    "countdown_target",                          # countdown (ISO datetime)
+    "theme_accent", "theme_accent_soft",         # warna tertentu (CSS color)
+    "cover_image",                               # cover
+    "gallery_1", "gallery_2", "gallery_3", "gallery_4",
+    "gallery_5", "gallery_6",                    # gallery terbatas 6-10 (inti 6)
+    "video_url",                                 # 1 video / YouTube
+    "music_url",                                 # musik background
+    "rsvp_url", "wa_link",                       # RSVP & tombol WhatsApp
+    "gift_bank", "gift_account_number", "gift_account_name",  # amplop digital
+    "to_guest",                                  # guest greeting / link personal
+    "invite_url",                                # link undangan personal
+    "date_id",                                   # tanggal format Indonesia
+    "wedding_start_iso",                         # internal: epoch detik start acara
+)
+# Gold: semua Silver + personalisasi & multiple event.
+GOLD_EXTRA_KEYS = (
+    "font_heading", "font_body",                 # pilihan font
+    "bg_image",                                  # custom background
+    "wording_open",                              # custom wording
+    "gallery_7", "gallery_8", "gallery_9", "gallery_10",  # gallery lebih besar (s.d. 10)
+    "video_2_url", "video_3_url",                # video lebih banyak
+    "ngunduh_mantu_date", "ngunduh_mantu_detail",  # Akad -> Resepsi -> Ngunduh Mantu
+    "bride_event", "groom_event", "wedding_event",   # Bride/Groom/Wedding Event
+    "custom_slug",                               # custom URL
+    "map_preview",                               # map preview (embed)
+    "og_title", "og_description", "og_image",    # social sharing preview
+    "guestbook_enabled", "qrcode_url",           # guestbook & QR code
+)
+# Platinum: semua Gold + penanda layanan full custom.
+PLATINUM_EXTRA_KEYS = (
+    "custom_request",                            # request tema dari client (mis. kerajaan Jawa modern)
+    "custom_reference",                          # link moodboard/referensi
+    "design_note",                               # catatan tim: dibuatkan khusus dari nol
+)
+
+EXTRA_KEY_GROUPS = {
+    "silver": SILVER_EXTRA_KEYS,
+    "gold": GOLD_EXTRA_KEYS,
+    "platinum": PLATINUM_EXTRA_KEYS,
+}
+
+def extra_keys_for_tier(tier):
+    """Placeholder opsional yang aktif untuk tier tertentu (Gold mencakup Silver, dst.)."""
+    keys = []
+    for t in ("silver", "gold", "platinum"):
+        keys.extend(EXTRA_KEY_GROUPS[t])
+        if t == (tier or "silver"):
+            break
+    return tuple(keys)
 
 # Placeholder yang wajib ada agar undangan informatif (couple_photo boleh opsional:
 # beberapa template memakai background CSS, tapi minimal nama & tanggal wajib).
@@ -32,30 +96,35 @@ _PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")
 _ANY_TOKEN_RE = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")
 
 
+def all_known_keys(tier=None):
+    """Seluruh key yang dikenal validator (inti + seluruh extra lintas tier)."""
+    keys = set(ALLOWED_KEYS)
+    for group in EXTRA_KEY_GROUPS.values():
+        keys.update(group)
+    return keys
+
+
 def find_placeholders(html_code):
     """Kembalikan daftar unik key placeholder valid yang dipakai template."""
+    known = all_known_keys()
     seen = []
     for m in _PLACEHOLDER_RE.finditer(html_code or ""):
         key = m.group(1)
-        if key in ALLOWED_KEYS and key not in seen:
+        if key in known and key not in seen:
             seen.append(key)
     return seen
 
 
 def find_unknown_placeholders(html_code):
-    """Token {{...}} yang bentuknya seperti placeholder tapi key-nya tidak dikenal.
-
-    Mengabaikan token yang jelas bukan identifier (mis. `{{ color }}` dari templating
-    lain atau JS `{{a:1}}`) — hanya menandai token yang *mirip* key (identifier-ish)
-    namun tidak termasuk ALLOWED_KEYS, supaya CSS/JS kurung kurawal tidak memicu error.
-    """
+    """Token {{...}} yang bentuknya seperti placeholder tapi key-nya tidak dikenal."""
+    known = all_known_keys()
     unknown = []
     for m in _ANY_TOKEN_RE.finditer(html_code or ""):
         inner = m.group(1)
         # hanya anggap "kandidat placeholder" bila isinya identifier sederhana
         if not re.fullmatch(r"[A-Za-z0-9_]+", inner):
             continue
-        if inner not in ALLOWED_KEYS and inner not in unknown:
+        if inner not in known and inner not in unknown:
             unknown.append(inner)
     return unknown
 
