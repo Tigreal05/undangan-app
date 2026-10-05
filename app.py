@@ -31,6 +31,9 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "").encode() or secrets.token_bytes(32)
 ALLOW_INSECURE_COOKIE = os.environ.get("ALLOW_INSECURE_COOKIE", "0") == "1"
 
+# Domain dasar untuk subdomain undangan client: https://[slug].{INVITE_DOMAIN}
+INVITE_DOMAIN = os.environ.get("INVITE_DOMAIN", "invite.sukamoto.web.id")
+
 PBKDF2_ITERATIONS = 200_000
 SESSION_MAX_AGE = 8 * 3600          # 8 jam
 LOGIN_WINDOW_SECONDS = 900          # 15 menit
@@ -211,6 +214,64 @@ def init_db():
         )
     ''')
     
+    # ---- Order lifecycle (flow [6] Kirim Pesanan s/d [13] EXPIRED) ----
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,            -- kode pembayaran unik, cth: SKT-A7K2MQ
+            slug TEXT UNIQUE NOT NULL,            -- nama pasangan -> https://[slug].invite.sukamoto.web.id
+            template_id INTEGER,
+            package_id INTEGER,
+            couple_name TEXT NOT NULL,            -- "Rian & Siska"
+            groom_name TEXT DEFAULT '',
+            bride_name TEXT DEFAULT '',
+            groom_insta TEXT DEFAULT '',
+            bride_insta TEXT DEFAULT '',
+            event_date TEXT DEFAULT '',           -- ISO yyyy-mm-dd ( utk penghitung masa aktif )
+            event_time TEXT DEFAULT '',
+            akkad_date TEXT DEFAULT '',
+            reception_date TEXT DEFAULT '',
+            venue_name TEXT DEFAULT '',
+            venue_address TEXT DEFAULT '',
+            maps_url TEXT DEFAULT '',
+            photo_url TEXT DEFAULT '',            -- foto cover hasil upload client
+            whatsapp TEXT DEFAULT '',             -- WA pemesan / RSVP
+            message TEXT DEFAULT '',              -- pesan pembuka undangan
+            status TEXT NOT NULL DEFAULT 'pending_payment',
+            payment_method TEXT DEFAULT '',
+            amount TEXT DEFAULT '',               -- nominal yang harus dibayar
+            proof_filename TEXT DEFAULT '',       -- bukti transfer (upload [8])
+            reject_reason TEXT DEFAULT '',
+            expires_at TEXT DEFAULT '',           -- tanggal EXPIRED ([12]->[13])
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # log riwayat status per order (timeline admin & audit)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS order_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            note TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    ''')
+    default_settings = [
+        ("payment_account", "BCA 1234567890 a.n SUKA MOTO"),
+        ("payment_qris", "QRIS via DANA/OVO 085156918852 a.n SUKA MOTO"),
+        ("admin_whatsapp", "6285156918852"),
+    ]
+    cursor.executemany('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', default_settings)
+
     cursor.execute("PRAGMA table_info(templates)")
     columns = [col[1] for col in cursor.fetchall()]
     if 'html_code' not in columns:
@@ -275,6 +336,277 @@ if _BOOT_ADMIN_HINT:
     print("[S0][SECURITY]", _BOOT_ADMIN_HINT)
     print("[S0][SECURITY] Segera ganti via env ADMIN_PASSWORD atau fitur ganti password.")
     print("=" * 60)
+
+# ============================================================
+# ORDER LIFECYCLE HELPERS
+#   pending_payment -> awaiting_verification -> verified
+#       -> processing -> active -> expired
+#   awaiting_verification --(reject)--> rejected_payment -> awaiting_verification
+# ============================================================
+import datetime as _dt
+
+ORDER_STATUS_LABEL = {
+    "pending_payment":      "[7] Menunggu Pembayaran",
+    "awaiting_verification":"[9] Menunggu Verifikasi Pembayaran",
+    "rejected_payment":     "[9] Ditolak - Perbaiki Pembayaran",
+    "verified":             "[10] Pembayaran Diverifikasi",
+    "processing":           "[10] Undangan Diproses",
+    "active":               "[11] Undangan Aktif",
+    "expired":              "[13] EXPIRED",
+}
+
+def get_setting(cursor, key, default=""):
+    cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
+    row = cursor.fetchone()
+    return row[0] if row else default
+
+def make_order_code():
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "SKT-" + "".join(secrets.choice(alphabet) for _ in range(6))
+
+def slugify(value):
+    """'Rian & Siska' -> 'rian-siska' (subdomain https://[slug].invite.sukamoto.web.id)."""
+    s = (value or "").lower()
+    s = s.replace("&", " dan ")
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s[:40]
+
+def unique_slug(cursor, base):
+    if not base:
+        base = "undangan"
+    slug, n = base, 1
+    while cursor.execute('SELECT 1 FROM orders WHERE slug = ?', (slug,)).fetchone():
+        n += 1
+        slug = "%s-%d" % (base, n)
+    return slug
+
+def add_order_event(cursor, order_id, status, note=""):
+    cursor.execute('INSERT INTO order_events (order_id, status, note) VALUES (?, ?, ?)',
+                   (order_id, status, note))
+
+def set_order_status(cursor, order_id, status, note=""):
+    cursor.execute("UPDATE orders SET status = ?, reject_reason = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                   (status, order_id))
+    add_order_event(cursor, order_id, status, note)
+
+def parse_amount_rupiah(text):
+    """'Rp 250.000' -> 250000 ; gagal -> 0."""
+    digits = re.sub(r"\D", "", text or "")
+    return int(digits) if digits else 0
+
+def duration_days_from_text(duration, price_text=""):
+    """Ambil angka hari dari keterangan durasi paket/template."""
+    d = (duration or "").lower()
+    m = re.search(r"(\d+)\s*(hari|bulan|minggu|tahun)", d)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        return n * {"hari": 1, "minggu": 7, "bulan": 30, "tahun": 365}[unit]
+    if "selamanya" in d or "seumur hidup" in d:
+        return 36500  # ~100 tahun
+    p = (price_text or "").lower()
+    if "platinum" in p or "vip" in p:
+        return 180
+    if "gold" in p:
+        return 90
+    if "silver" in p:
+        return 30
+    return 30
+
+def compute_expires_at(order_row):
+    """Masa aktif mulai dari tanggal acara; fallback: sejak diaktifkan."""
+    _, tmpl_dur, pkg_dur, event_date, amount = order_row
+    days = duration_days_from_text(tmpl_dur)
+    days2 = duration_days_from_text(pkg_dur)
+    days = min(days, days2) if (tmpl_dur and pkg_dur) else max(days, days2)
+    start = None
+    try:
+        start = _dt.date.fromisoformat(event_date)
+    except Exception:
+        start = None
+    if start is None:
+        start = _dt.date.today()
+    return (start + _dt.timedelta(days=days)).isoformat()
+
+def refresh_expired_orders():
+    """[12] Masa Aktif Berjalan -> [13] EXPIRED otomatis saat melewati expires_at."""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM orders WHERE status = 'active' AND expires_at != '' AND expires_at < ?",
+                (_dt.date.today().isoformat(),))
+    ids = [r[0] for r in cur.fetchall()]
+    for oid in ids:
+        cur.execute("UPDATE orders SET status = 'expired', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (oid,))
+        add_order_event(cur, oid, "expired", "Masa aktif habis (otomatis)")
+    conn.commit()
+    conn.close()
+    return ids
+
+def invite_url_for(slug):
+    return "https://%s.%s" % (slug, INVITE_DOMAIN)
+
+def wa_admin_link(order_row, approve=True):
+    """Link chat WA admin berisi laporan pesanan siap kirim (sisi admin)."""
+    (oid, code, slug, cname, wa, amount, status) = order_row[:7]
+    url = invite_url_for(slug)
+    if approve:
+        msg = ("Halo %s, pembayaran undangan dengan kode %s sudah KAMI VERIFIKASI.\n"
+               "Undangan Anda kini AKTIF di: %s\n"
+               "Silakan bagikan ke para tamu. Terima kasih telah menggunakan SUKA MOTO!" % (cname, code, url))
+    else:
+        msg = ("Halo %s, mohon maaf bukti pembayaran untuk kode %s belum dapat kami verifikasi.\n"
+               "Silakan periksa kembali dan upload ulang bukti transfernya melalui halaman status pesanan Anda.\n"
+               "Terima kasih. - SUKA MOTO") % (cname, code)
+    admin_wa = ""
+    conn = sqlite3.connect(DB_NAME)
+    admin_wa = get_setting(conn.cursor(), "admin_whatsapp", "6285156918852")
+    conn.close()
+    return "https://wa.me/%s?text=%s" % (re.sub(r"\D", "", admin_wa), urlquote(msg))
+
+MONTHS_ID = ["Januari", "Februari", "Maret", "April", "Mei", "Juni",
+             "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+DAYS_ID = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+
+def format_date_id(iso):
+    try:
+        d = _dt.date.fromisoformat(iso)
+        return "%s, %d %s %d" % (DAYS_ID[d.weekday()], d.day, MONTHS_ID[d.month - 1], d.year)
+    except Exception:
+        return iso or "-"
+
+def render_invitation_html(html_code, o):
+    """Injeksi data undangan ke dalam html_code template.
+    Mendukung 2 gaya:
+      1) token {{nama_field}} di dalam HTML template
+      2) atribut data-field="nama_field" pada elemen (untuk template lama contenteditable)
+    """
+    tokens = {
+        "couple_name": o["couple_name"],
+        "groom_name": o["groom_name"],
+        "bride_name": o["bride_name"],
+        "groom_insta": "@" + o["groom_insta"].lstrip("@") if o["groom_insta"] else "",
+        "bride_insta": "@" + o["bride_insta"].lstrip("@") if o["bride_insta"] else "",
+        "event_date": format_date_id(o["event_date"]),
+        "event_time": o["event_time"],
+        "akkad_date": format_date_id(o["akkad_date"] or o["event_date"]),
+        "reception_date": format_date_id(o["reception_date"] or o["event_date"]),
+        "venue_name": o["venue_name"],
+        "venue_address": o["venue_address"],
+        "maps_url": o["maps_url"] or "#",
+        "photo_url": o["photo_url"],
+        "whatsapp": o["whatsapp"],
+        "message": o["message"],
+        "code": o["code"],
+        "link": invite_url_for(o["slug"]),
+    }
+    out = html_code or ""
+    for k, v in tokens.items():
+        out = out.replace("{{%s}}" % k, _escape(v))
+
+    def fill_data_fields(fragment):
+        def repl(m):
+            tag, field = m.group(1), m.group(2)
+            val = tokens.get(field, "")
+            low = tag.lower()
+            if 'src="' in low or "src='" in low:
+                tag = re.sub(r"(src=)(\"[^\"]*\"|'[^']*')", lambda _: 'src="%s"' % _escape(val), tag, count=1)
+            elif 'href="' in low or "href='" in low:
+                tag = re.sub(r"(href=)(\"[^\"]*\"|'[^']*')", lambda _: 'href="%s"' % _escape(val), tag, count=1)
+            else:
+                tag = re.sub(r">\s*$", ">", tag)
+                tag = tag + _escape(val) + "</%s>" % re.match(r"<\s*([a-zA-Z0-9]+)", low).group(1)
+            return tag
+        return re.sub(r"(<[a-zA-Z0-9]+[^>]*?\bdata-field=[\"']([a-z_]+)[\"'][^>]*?>)", repl, fragment)
+
+    out = fill_data_fields(out)
+    # bersihkan token yang tidak terisi agar client tidak melihat "{{...}}"
+    out = re.sub(r"\{\{[a-z_]+\}\}", "", out)
+    return out
+
+# ---- UI bantu untuk alur client (stepper + kartu status pesanan) ----
+WIZARD_STEPS = ["Landing", "Paket", "Template", "Data", "Preview", "Kirim", "Bayar", "Bukti", "Verifikasi", "Diproses", "Aktif"]
+
+def stepbar_html(active_no):
+    items = ""
+    for i, label in enumerate(WIZARD_STEPS, start=1):
+        state = "done" if i < active_no else ("now" if i == active_no else "todo")
+        color = "#34d399" if state == "done" else ("#fbbf24" if state == "now" else "#3f3f46")
+        bg = "#18181b"
+        items += ('<div style="flex:1; text-align:center;">'
+                  '<div style="width:20px;height:20px;line-height:20px;margin:0 auto;border-radius:50%%;'
+                  'background:%s;color:#000;font-size:10px;font-weight:800;">%s</div>'
+                  '<div style="font-size:8px;color:%s;margin-top:3px;white-space:nowrap;">%s</div></div>') % (
+                  color, ("%d" % i) if state != "done" else "&#10003;", color, label)
+    return ('<div style="display:flex;gap:2px;background:%s;border:1px solid #27272a;border-radius:10px;'
+            'padding:10px 6px;margin-bottom:18px;overflow-x:auto;">%s</div>') % (bg, items)
+
+ORDER_CSS = """
+    .order-card { background: #18181b; border: 1px solid #27272a; border-radius: 14px; padding: 18px; margin-bottom: 15px; }
+    .order-card h3 { font-size: 14px; color: #fff; margin-bottom: 10px; }
+    .o-row { display: flex; justify-content: space-between; font-size: 12px; color: #a1a1aa; margin-bottom: 8px; gap: 10px; }
+    .o-row strong { color: #fff; text-align: right; word-break: break-all; }
+    .status-pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 10px; font-weight: 800; }
+    .st-pending_payment { background:#78350f; color:#fcd34d; }
+    .st-awaiting_verification { background:#1e3a8a; color:#93c5fd; }
+    .st-rejected_payment { background:#7f1d1d; color:#fecaca; }
+    .st-verified { background:#14532d; color:#86efac; }
+    .st-processing { background:#3b0764; color:#d8b4fe; }
+    .st-active { background:#064e3b; color:#34d399; }
+    .st-expired { background:#27272a; color:#a1a1aa; }
+    .big-code { font-size: 20px; letter-spacing: 2px; color: #fbbf24; font-weight: 800; text-align: center; background: #121215; border: 1px dashed #fbbf24; padding: 10px; border-radius: 8px; margin: 10px 0; }
+    .btn-primary { display:block; width:100%; background:#fbbf24; color:#000; font-weight:800; padding:12px; border:none; border-radius:8px; font-size:13px; cursor:pointer; text-align:center; text-decoration:none; margin-top:10px; }
+    .btn-secondary { display:block; width:100%; background:#27272a; color:#fff; font-weight:700; padding:11px; border:1px solid #3f3f46; border-radius:8px; font-size:12px; cursor:pointer; text-align:center; text-decoration:none; margin-top:8px; }
+    .btn-wa { display:block; width:100%; background:#22c55e; color:#fff; font-weight:800; padding:12px; border:none; border-radius:8px; font-size:13px; text-align:center; text-decoration:none; margin-top:10px; }
+    input, select, textarea { padding: 10px; margin: 5px 0; border-radius: 8px; border: 1px solid #3f3f46; background: #121215; color: #fff; width: 100%; font-size: 12px; }
+    label.fld { font-size: 11px; color: #a1a1aa; display: block; margin-top: 8px; }
+"""
+
+def order_status_card(o, show_actions=True):
+    """o = dict row orders. Render kartu status sesuai langkah [7]-[13]."""
+    status = o["status"]
+    pill = '<span class="status-pill st-%s">%s</span>' % (status, _escape(ORDER_STATUS_LABEL.get(status, status)))
+    url = invite_url_for(o["slug"])
+    html = '<div class="order-card"><h3>Pesanan %s &nbsp; %s</h3>' % (_escape(o["code"]), pill)
+    html += '<div class="o-row"><span>Nama Pasangan</span><strong>%s</strong></div>' % _escape(o["couple_name"])
+    html += '<div class="o-row"><span>Nomor WhatsApp</span><strong>%s</strong></strong></div>' % _escape(o["whatsapp"])
+    html += '<div class="o-row"><span>Total Pembayaran</span><strong style="color:#34d399;">%s</strong></div>' % _escape(o["amount"])
+    if status == "active":
+        remaining = "-"
+        try:
+            d = (_dt.date.fromisoformat(o["expires_at"]) - _dt.date.today()).days
+            remaining = "%d hari lagi" % max(d, 0)
+        except Exception:
+            pass
+        html += ('<div class="o-row"><span>Link Undangan</span><strong><a href="%s" target="_blank" '
+                 'style="color:#34d399;">%s</a></strong></div>' % (_escape(url), _escape(url)))
+        html += '<div class="o-row"><span>Masa Aktif</span><strong>s/d %s (%s)</strong></div>' % (
+            _escape(format_date_id(o["expires_at"])), _escape(remaining))
+        html += ('<div style="font-size:10px;color:#71717a;margin-top:6px;">[12] Masa aktif berjalan otomatis. '
+                 'Setelah melewati tanggal di atas undangan menjadi EXPIRED.</div>')
+    elif status == "expired":
+        html += '<div class="o-row"><span>Link Undangan</span><strong style="color:#a1a1aa;">%s (nonaktif)</strong></div>' % _escape(url)
+        html += '<div style="font-size:11px;color:#ef4444;font-weight:bold;margin-top:6px;">[13] MASA AKTIF UNDANGAN SUDAH HABIS (EXPIRED).</div>'
+        html += '<div style="font-size:11px;color:#a1a1aa;">Hubungi admin via WhatsApp untuk perpanjangan paket.</div>'
+    elif status == "pending_payment":
+        html += '<div class="big-code">%s</div>' % _escape(o["code"])
+        html += ('<div style="font-size:11px;color:#a1a1aa;">Transfer sesuai nominal lalu tulis <b>kode pembayaran unik</b> '
+                 'di atas pada berita transfer, kemudian upload bukti pembayaran.</div>')
+    elif status == "awaiting_verification":
+        html += '<div class="o-row"><span>Bukti Pembayaran</span><strong>Terupload, menunggu verifikasi admin</strong></div>'
+        html += '<div style="font-size:11px;color:#93c5fd;margin-top:6px;"><i class="fa-regular fa-hourglass-half"></i> '
+        'Admin akan memeriksa transfer Anda. Status halaman ini akan berubah setelah diverifikasi.</div>'
+    elif status == "rejected_payment":
+        html += '<div style="background:#7f1d1d;color:#fecaca;font-size:11px;padding:10px;border-radius:8px;margin-top:8px;">'
+        '&#10060; Bukti pembayaran ditolak: %s<br>Silakan perbaiki dan upload ulang bukti transfer di bawah.</div>' % _escape(o["reject_reason"] or "data transfer tidak cocok")
+    elif status in ("verified", "processing"):
+        html += '<div class="o-row"><span>Tahap</span><strong>%s</strong></div>' % _escape(ORDER_STATUS_LABEL.get(status, status))
+        html += '<div style="font-size:11px;color:#d8b4fe;margin-top:6px;">Undangan Anda sedang kami proses. '
+        'Link final akan dikirim ke WhatsApp <b>%s</b>.</div>' % _escape(o["whatsapp"])
+    if o.get("proof_filename"):
+        purl = "/static_uploads/" + urlquote(os.path.basename(o["proof_filename"]))
+        html += '<div style="margin-top:10px;font-size:10px;color:#71717a;">Bukti bayar terakhir: <a href="%s" target="_blank" style="color:#fbbf24;">lihat gambar</a></div>' % _escape(purl)
+    html += '</div>'
+    return html
+
 
 BASE_HEAD = """
     <meta charset="UTF-8">
@@ -352,6 +684,531 @@ ADMIN_SECURITY_SCRIPT = """
         }
     </script>
 """
+
+# ============================================================
+# ALUR CLIENT: [1] Landing -> [2] Paket -> [3] Template -> [4] Data
+#   -> [5] Preview -> [6] Kirim Pesanan -> [7] Pembayaran -> [8] Bukti
+#   -> [9] Verifikasi -> [10] Diproses -> [11] Aktif -> [12] Masa Aktif -> [13] EXPIRED
+# ============================================================
+def client_page(title, step_no, body_html, extra_head=""):
+    return """<!DOCTYPE html>
+<html lang="id">
+<head>
+%s
+<title>%s | SUKA MOTO Invitation</title>
+<style>%s</style>
+%s
+</head>
+<body>
+<div class="container">
+  <div class="content-wrap">
+    <div class="navbar">
+      <a href="/" class="brand-group"><span class="brand-main">SUKA MOTO</span><span class="brand-sub">Invitation</span></a>
+      <div class="nav-actions"><a href="/my-orders" style="font-size:10px;color:#fbbf24;text-decoration:none;font-weight:bold;">Cek Pesanan</a></div>
+    </div>
+    %s
+    %s
+  </div>
+  %s
+</div>
+</body>
+</html>""" % (BASE_HEAD, _escape(title), ORDER_CSS, extra_head,
+             stepbar_html(step_no) if step_no else "", body_html, FOOTER_HTML)
+
+def fetch_order(conn, code=None, oid=None):
+    cur = conn.cursor()
+    if code:
+        cur.execute("SELECT * FROM orders WHERE code = ?", (code.upper(),))
+    else:
+        cur.execute("SELECT * FROM orders WHERE id = ?", (oid,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return dict(zip([c[0] for c in cur.description], row))
+
+async def handle_start(request):
+    """[2] Pilih Paket."""
+    conn = sqlite3.connect(DB_NAME)
+    pkgs = conn.execute('SELECT id, name, subtitle, image_url FROM packages ORDER BY id').fetchall()
+    conn.close()
+    pkg_meta = {1: ("Silver", "Aktif 30 hari"), 2: ("Gold", "Aktif 90 hari"), 3: ("Platinum VIP", "Aktif 6 bulan")}
+    cards = ""
+    for pid, name, sub, img in pkgs:
+        tag, dur = pkg_meta.get(pid, (name, "Paket pilihan"))
+        cards += """
+        <a href="/templates?package_id=%d&from=start" style="background:#18181b;border:1px solid #27272a;border-radius:14px;overflow:hidden;text-decoration:none;display:block;margin-bottom:12px;">
+          <img src="%s" alt="" style="width:100%%;height:110px;object-fit:cover;display:block;">
+          <div style="padding:12px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <h3 style="font-size:13px;color:#fff;font-weight:800;">%s</h3>
+              <span style="font-size:9px;background:#3f3f46;color:#fbbf24;padding:2px 8px;border-radius:99px;font-weight:bold;">%s</span>
+            </div>
+            <p style="font-size:11px;color:#a1a1aa;margin:4px 0 8px;">%s</p>
+            <div style="font-size:11px;color:#34d399;font-weight:bold;"><i class="fa-regular fa-clock"></i> %s &bull; Lihat Koleksi Template &rarr;</div>
+          </div>
+        </a>""" % (pid, _escape(img), _escape(name), _escape(tag), _escape(sub), _escape(dur))
+    body = """
+    <div class="section-title">Langkah 2 &mdash; Pilih Paket</div>
+    <div class="order-card" style="border-left:3px solid #fbbf24;">
+      <h3>Paket Undangan</h3>
+      <p style="font-size:11px;color:#a1a1aa;line-height:1.6;">Setelah memilih paket, Anda akan diarahkan ke halaman
+      <b>Kirim Pesanan</b> untuk menyelesaikan pembayaran. Link undangan memakai subdomain
+      <span style="color:#34d399;">nama-pasangan.%s</span>.</p>
+    </div>
+    %s
+    <a href="/" class="btn-secondary">&larr; Kembali ke Beranda</a>
+    """ % (_escape(INVITE_DOMAIN), cards)
+    return web.Response(text=client_page("Pilih Paket", 2, body), content_type="text/html")
+
+async def handle_form(request):
+    """[4] Isi Data Undangan."""
+    tmpl_id = request.query.get("template_id", "")
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute('SELECT t.id, t.name, t.price, t.discount, t.duration, p.id, p.name '
+                'FROM templates t JOIN packages p ON t.package_id = p.id WHERE t.id = ?', (tmpl_id,))
+    tmpl = cur.fetchone()
+    conn.close()
+    if not tmpl:
+        raise web.HTTPFound("/start")
+    tid, tname, tprice, tdisc, tdur, pid, pname = tmpl
+    saved = request.query  # nilai kembali jika validasi gagal
+    def v(key, default=""):
+        return _escape(saved.get(key, default))
+    body = """
+    <div class="section-title">Langkah 4 &mdash; Isi Data Undangan</div>
+    <div class="order-card" style="border-left:3px solid #34d399;">
+      <div style="display:flex;justify-content:space-between;font-size:12px;">
+        <span style="color:#a1a1aa;">Template Terpilih</span>
+        <strong style="color:#fff;">%(tname)s <span style="color:#34d399;">(%(tprice)s)</span></strong>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;margin-top:6px;">
+        <span style="color:#a1a1aa;">Paket / Durasi</span><strong style="color:#fff;">%(pname)s &bull; %(tdur)s</strong>
+      </div>
+    </div>
+    <form action="/preview" method="POST" class="order-card">
+      <input type="hidden" name="template_id" value="%(tid)s">
+      <h3>Mempelai</h3>
+      <label class="fld">Nama Pasangan ( utk link: nama-pasangan.%(dom)s ) *</label>
+      <input type="text" name="couple_name" required placeholder="Contoh: Rian & Siska" value="%(couple_name)s">
+      <label class="fld">Nama Mempelai Pria *</label>
+      <input type="text" name="groom_name" required placeholder="Nama lengkap + gelar" value="%(groom_name)s">
+      <label class="fld">Nama Mempelai Wanita *</label>
+      <input type="text" name="bride_name" required placeholder="Nama lengkap + gelar" value="%(bride_name)s">
+      <label class="fld">Instagram Pria</label>
+      <input type="text" name="groom_insta" placeholder="@username" value="%(groom_insta)s">
+      <label class="fld">Instagram Wanita</label>
+      <input type="text" name="bride_insta" placeholder="@username" value="%(bride_insta)s">
+
+      <h3 style="margin-top:16px;">Acara &amp; Lokasi</h3>
+      <label class="fld">Tanggal Akad Nikah *</label>
+      <input type="date" name="akkad_date" required value="%(akkad_date)s">
+      <label class="fld">Tanggal Resepsi *</label>
+      <input type="date" name="reception_date" required value="%(reception_date)s">
+      <label class="fld">Waktu Acara</label>
+      <input type="text" name="event_time" placeholder="Contoh: 10.00 - 14.00 WIB" value="%(event_time)s">
+      <label class="fld">Nama Gedung / Tempat *</label>
+      <input type="text" name="venue_name" required placeholder="Gedung Kencana" value="%(venue_name)s">
+      <label class="fld">Alamat Lengkap *</label>
+      <textarea name="venue_address" rows="2" required placeholder="Jl. ... , Kota ...">%(venue_address)s</textarea>
+      <label class="fld">Link Lokasi Google Maps</label>
+      <input type="url" name="maps_url" placeholder="https://maps.google.com/..." value="%(maps_url)s">
+
+      <h3 style="margin-top:16px;">Foto &amp; WhatsApp</h3>
+      <label class="fld">Upload Foto Cover Mempelai (jpg/png/webp, maks 5 MB)</label>
+      <input type="file" name="photo" accept=".jpg,.jpeg,.png,.webp,.gif" style="background:#121215;padding:6px;">
+      <label class="fld">Nomor WhatsApp Pemesan / RSVP *</label>
+      <input type="tel" name="whatsapp" required placeholder="08123456789" value="%(whatsapp)s">
+      <label class="fld">Pesan Pembuka Undangan</label>
+      <textarea name="message" rows="2" placeholder="Tanpa mengurangi rasa hormat...">%(message)s</textarea>
+      <button type="submit" class="btn-primary"><i class="fa-regular fa-eye"></i> Lanjut ke Preview &rarr;</button>
+    </form>
+    <a href="/template-action?id=%(tid)s" class="btn-secondary">&larr; Ganti Template</a>
+    """ % dict(dom=_escape(INVITE_DOMAIN), tid=tid, tname=_escape(tname), tprice=_escape(tprice),
+               pname=_escape(pname), tdur=_escape(tdur or "-"),
+               **{k: v(k) for k in ["couple_name", "groom_name", "bride_name", "groom_insta", "bride_insta",
+                                    "akkad_date", "reception_date", "event_time", "venue_name",
+                                    "venue_address", "maps_url", "whatsapp", "message"]})
+    return web.Response(text=client_page("Isi Data Undangan", 4, body), content_type="text/html")
+
+async def handle_preview(request):
+    """[5] Preview — render template dengan data yang baru diisi (+ upload foto)."""
+    data = await request.post()
+    tmpl_id = data.get("template_id", "")
+    couple = (data.get("couple_name") or "").strip()
+    errors = []
+    if not couple:
+        errors.append("Nama pasangan wajib diisi.")
+    if not re.match(r"^[0-9+\-\s]{8,16}$", (data.get("whatsapp") or "").strip()):
+        errors.append("Nomor WhatsApp tidak valid (contoh: 08123456789).")
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute('SELECT t.id, t.name, t.price, t.duration, t.html_code, p.id, p.name, p.duration '
+                'FROM templates t JOIN packages p ON t.package_id = p.id WHERE t.id = ?', (tmpl_id,))
+    tmpl = cur.fetchone()
+    if errors or not tmpl:
+        conn.close()
+        qs = urlquote("&".join("%s=%s" % (k, urlquote(str(val))) for k, val in data.items()))
+        msg = " | ".join(errors) if errors else "Template tidak ditemukan."
+        raise web.HTTPFound("/form?template_id=%s&error=%s&%s" % (urlquote(str(tmpl_id)), urlquote(msg), qs))
+
+    _, tname, tprice, tdur, html_code, pid, pname, _pkgdur = tmpl
+    # upload foto cover (validasi sama seperti file manager admin)
+    photo_url = ""
+    reader = request.content_type.startswith("multipart") and await request.multipart() or None
+    if reader:
+        field = await reader.next()
+        while field is not None:
+            if field.name == "photo" and field.filename:
+                original = os.path.basename(field.filename)
+                ext = os.path.splitext(original)[1].lower()
+                declared = (field.headers.get("Content-Type") if field.headers else "").split(";")[0].strip().lower()
+                guessed = mimetypes.guess_type(original)[0] or ""
+                if ext in ALLOWED_UPLOAD_EXTS and (not declared or declared in ALLOWED_UPLOAD_MIMES) \
+                        and (not guessed or guessed in ALLOWED_UPLOAD_MIMES):
+                    safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", os.path.splitext(original)[0])[:40] or "foto"
+                    saved_name = "client_%s_%d%s" % (safe_stem, int(time.time() * 1000), ext)
+                    fpath = os.path.join(UPLOAD_DIR, saved_name)
+                    size, oversize = 0, False
+                    with open(fpath, "wb") as f:
+                        while True:
+                            chunk = await field.read_chunk()
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            if size > MAX_UPLOAD_BYTES:
+                                oversize = True
+                                break
+                            f.write(chunk)
+                    if oversize or size == 0:
+                        try:
+                            os.remove(fpath)
+                        except OSError:
+                            pass
+                    else:
+                        photo_url = "/static_uploads/" + urlquote(saved_name)
+                break
+            field = await reader.next()
+
+    o = {
+        "couple_name": couple,
+        "groom_name": data.get("groom_name", ""), "bride_name": data.get("bride_name", ""),
+        "groom_insta": data.get("groom_insta", ""), "bride_insta": data.get("bride_insta", ""),
+        "event_date": data.get("reception_date", ""), "event_time": data.get("event_time", ""),
+        "akkad_date": data.get("akkad_date", ""), "reception_date": data.get("reception_date", ""),
+        "venue_name": data.get("venue_name", ""), "venue_address": data.get("venue_address", ""),
+        "maps_url": data.get("maps_url", ""), "photo_url": photo_url,
+        "whatsapp": data.get("whatsapp", ""), "message": data.get("message", ""),
+        "code": "(belum dibuat)", "slug": slugify(couple) or "undangan",
+    }
+    rendered = render_invitation_html(html_code, o)
+    preview_frame = """
+    <div class="section-title">Langkah 5 &mdash; Preview</div>
+    <div class="order-card" style="padding:12px;">
+      <h3 style="margin-bottom:6px;">Begini tampilan undanganmu 🎀</h3>
+      <p style="font-size:11px;color:#a1a1aa;margin-bottom:10px;">Template: <b style="color:#fff;">%(tname)s</b> &bull; %(tprice)s. Cek detail di bawah, lalu lanjut kirim pesanan.</p>
+      <iframe srcdoc="%(srcdoc)s" style="width:100%%;height:420px;border:1px solid #3f3f46;border-radius:10px;background:#fff;"></iframe>
+      <a href="#" onclick="var f=document.querySelector('iframe');window.open('').document.write(f.getAttribute('srcdoc'));return false;" class="btn-secondary" style="font-size:11px;">Buka Preview Fullscreen</a>
+    </div>
+    <form action="/submit-order" method="POST" class="order-card" style="padding:14px;">
+      <h3>Konfirmasi Data</h3>
+      %(fields)s
+      <button type="submit" class="btn-primary"><i class="fa-solid fa-paper-plane"></i> [6] Kirim Pesanan &rarr;</button>
+      <p style="font-size:10px;color:#71717a;margin-top:8px;">Dengan mengirim pesanan Anda setuju melanjutkan ke tahap pembayaran sesuai nominal yang tertera.</p>
+    </form>
+    """ % dict(tname=_escape(tname), tprice=_escape(tprice), srcdoc=_escape(rendered),
+               fields="".join('<input type="hidden" name="%s" value="%s">' % (k, _escape(v))
+                              for k, v in [("template_id", tmpl_id), ("photo_url", photo_url)] +
+                              [(f, data.get(f, "")) for f in
+                               ["couple_name", "groom_name", "bride_name", "groom_insta", "bride_insta",
+                                "akkad_date", "reception_date", "event_time", "venue_name",
+                                "venue_address", "maps_url", "whatsapp", "message"]]))
+    conn.close()
+    return web.Response(text=client_page("Preview Undangan", 5, preview_frame), content_type="text/html")
+
+async def handle_submit_order(request):
+    """[6] Kirim Pesanan -> Order dibuat (kode unik + slug subdomain) -> [7] Pembayaran."""
+    data = await request.post()
+    couple = (data.get("couple_name") or "").strip()
+    tmpl_id = data.get("template_id")
+    if not couple or not tmpl_id:
+        raise web.HTTPFound("/start")
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute('SELECT t.price, t.duration, p.id, p.name FROM templates t JOIN packages p ON t.package_id=p.id WHERE t.id=?', (tmpl_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise web.HTTPFound("/start")
+    tprice, tdur, pid, pname = row
+    slug = unique_slug(cur, slugify(couple))
+    # kode unik + anti duplikat
+    while True:
+        code = make_order_code()
+        if not cur.execute('SELECT 1 FROM orders WHERE code=?', (code,)).fetchone():
+            break
+    cur.execute('''INSERT INTO orders (code, slug, template_id, package_id, couple_name, groom_name, bride_name,
+                 groom_insta, bride_insta, event_date, event_time, akkad_date, reception_date, venue_name,
+                 venue_address, maps_url, photo_url, whatsapp, message, status, amount)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending_payment',?)''',
+                (code, slug, tmpl_id, pid, couple, data.get("groom_name", ""), data.get("bride_name", ""),
+                 data.get("groom_insta", ""), data.get("bride_insta", ""), data.get("reception_date", ""),
+                 data.get("event_time", ""), data.get("akkad_date", ""), data.get("reception_date", ""),
+                 data.get("venue_name", ""), data.get("venue_address", ""), data.get("maps_url", ""),
+                 data.get("photo_url", ""), data.get("whatsapp", ""), data.get("message", ""), tprice))
+    oid = cur.lastrowid
+    add_order_event(cur, oid, "pending_payment", "Pesanan dibuat oleh client")
+    conn.commit()
+    conn.close()
+    raise web.HTTPFound("/payment?code=" + urlquote(code))
+
+STATUS_STEP = {"pending_payment": 7, "awaiting_verification": 9, "rejected_payment": 8,
+               "verified": 10, "processing": 10, "active": 11, "expired": 13}
+
+def payment_instruction_html(o):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    account = get_setting(cur, "payment_account", "BCA 1234567890 a.n SUKA MOTO")
+    qris = get_setting(cur, "payment_qris", "QRIS 085156918852 a.n SUKA MOTO")
+    conn.close()
+    amt_num = parse_amount_rupiah(o["amount"])
+    cents = (int(o["id"]) * 7) % 87 + 3  # unik per order utk memudahkan identifikasi transfer
+    total = "%s%03d" % (("{:,}".format(amt_num).replace(",", ".")) if amt_num else "-", cents)
+    return """
+    <div class="order-card" style="border-left:3px solid #34d399;">
+      <h3>[7] Instruksi Pembayaran</h3>
+      <div class="o-row"><span>Nominal Transfer</span><strong style="color:#34d399;font-size:15px;">Rp %(total)s</strong></div>
+      <div class="o-row"><span>Rekening Bank</span><strong>%(acc)s</strong></div>
+      <div class="o-row"><span>QRIS / E-Wallet</span><strong>%(qris)s</strong></div>
+      <div style="background:#121215;border:1px dashed #fbbf24;border-radius:8px;padding:10px;margin-top:8px;font-size:11px;color:#fcd34d;">
+        3 digit akhir <b>%(total)s</b> adalah kode unik dari sistem. Tulis juga kode pesanan
+        <b>%(code)s</b> pada berita transfer agar cepat diverifikasi.
+      </div>
+    </div>""" % dict(total=_escape(total), acc=_escape(account), qris=_escape(qris), code=_escape(o["code"]))
+
+async def handle_payment(request):
+    """[7] Halaman pembayaran + instruksi."""
+    code = request.query.get("code", "")
+    o = fetch_order(sqlite3.connect(DB_NAME), code=code)
+    if not o:
+        raise web.HTTPFound("/track")
+    if o["status"] != "pending_payment":
+        raise web.HTTPFound("/track?code=" + urlquote(o["code"]))
+    body = """
+    <div class="section-title">Langkah 7 &mdash; Pembayaran</div>
+    %s
+    %s
+    <a href="/upload-proof?code=%s" class="btn-primary"><i class="fa-solid fa-upload"></i> [8] Sudah Bayar? Upload Bukti Transfer &rarr;</a>
+    <a href="/track?code=%s" class="btn-secondary">Lihat Status Pesanan</a>
+    """ % (order_status_card(o), payment_instruction_html(o), urlquote(o["code"]), urlquote(o["code"]))
+    return web.Response(text=client_page("Pembayaran", 7, body), content_type="text/html")
+
+async def handle_upload_proof(request):
+    """[8] Upload bukti pembayaran -> status awaiting_verification."""
+    code = request.query.get("code", "")
+    o = fetch_order(sqlite3.connect(DB_NAME), code=code)
+    if not o:
+        raise web.HTTPFound("/track")
+    if o["status"] not in ("pending_payment", "rejected_payment"):
+        raise web.HTTPFound("/track?code=" + urlquote(o["code"]))
+    note = ""
+    if o["status"] == "rejected_payment":
+        note = '<div style="background:#7f1d1d;color:#fecaca;font-size:11px;padding:10px;border-radius:8px;margin-bottom:12px;">&#10060; Bukti sebelumnya ditolak: %s. Silakan upload ulang.</div>' % _escape(o["reject_reason"] or "data transfer tidak cocok")
+    body = """
+    <div class="section-title">Langkah 8 &mdash; Upload Bukti Pembayaran</div>
+    %s%s
+    <form action="/upload-proof?code=%s" method="POST" enctype="multipart/form-data" class="order-card">
+      <h3>Bukti Transfer</h3>
+      <label class="fld">Foto/Screenshot bukti transfer (jpg/png/webp/pdf, maks 5 MB) *</label>
+      <input type="file" name="proof" required accept=".jpg,.jpeg,.png,.webp,.gif,.pdf" style="background:#121215;padding:6px;">
+      <label class="fld">Nama Pengirim Transfer (opsional)</label>
+      <input type="text" name="sender" placeholder="Sesuai rekening pengirim">
+      <button type="submit" class="btn-primary"><i class="fa-solid fa-circle-check"></i> Kirim Bukti &amp; Menunggu Verifikasi</button>
+    </form>
+    """ % (note, order_status_card(o), urlquote(o["code"]))
+    return web.Response(text=client_page("Upload Bukti Pembayaran", 8, body), content_type="text/html")
+
+async def handle_upload_proof_post(request):
+    code = request.query.get("code", "")
+    o = fetch_order(sqlite3.connect(DB_NAME), code=code)
+    if not o:
+        raise web.HTTPFound("/track")
+    if o["status"] not in ("pending_payment", "rejected_payment"):
+        raise web.HTTPFound("/track?code=" + urlquote(o["code"]))
+    reader = await request.multipart()
+    field = await reader.next()
+    saved_name, sender = None, ""
+    while field is not None:
+        if field.name == "proof" and field.filename:
+            original = os.path.basename(field.filename)
+            ext = os.path.splitext(original)[1].lower()
+            declared = (field.headers.get("Content-Type") if field.headers else "").split(";")[0].strip().lower()
+            guessed = mimetypes.guess_type(original)[0] or ""
+            if ext in ALLOWED_UPLOAD_EXTS and (not declared or declared in ALLOWED_UPLOAD_MIMES) \
+                    and (not guessed or guessed in ALLOWED_UPLOAD_MIMES):
+                safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", os.path.splitext(original)[0])[:40] or "bukti"
+                cand = "bukti_%s_%d%s" % (safe_stem, int(time.time() * 1000), ext)
+                fpath = os.path.join(UPLOAD_DIR, cand)
+                size, oversize = 0, False
+                with open(fpath, "wb") as f:
+                    while True:
+                        chunk = await field.read_chunk()
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_UPLOAD_BYTES:
+                            oversize = True
+                            break
+                        f.write(chunk)
+                if oversize or size == 0:
+                    try:
+                        os.remove(fpath)
+                    except OSError:
+                        pass
+                else:
+                    saved_name = cand
+        elif field.name == "sender":
+            sender = ((await field.read(decode=True)) or b"").decode("utf-8", "replace")[:60]
+        field = await reader.next()
+    if not saved_name:
+        raise web.HTTPFound("/upload-proof?code=" + urlquote(o["code"]) + "&err=file")
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute('UPDATE orders SET proof_filename = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                (saved_name, "awaiting_verification", o["id"]))
+    add_order_event(cur, o["id"], "awaiting_verification", "Bukti bayar diupload oleh client. Pengirim: " + sender)
+    conn.commit()
+    conn.close()
+    raise web.HTTPFound("/track?code=" + urlquote(o["code"]))
+
+async def handle_track(request):
+    """Halaman status pesanan client ([7]-[13]) berdasarkan kode / daftar via WA."""
+    refresh_expired_orders()
+    code = request.query.get("code", "").upper()
+    err = request.query.get("err", "")
+    if not code:
+        body = """
+        <div class="section-title">Cek Status Pesanan</div>
+        <div class="order-card">
+          <h3>Masukkan Kode Pembayaran</h3>
+          <p style="font-size:11px;color:#a1a1aa;margin-bottom:8px;">Kode unik dikirim saat pesanan dibuat, contoh: SKT-A7K2MQ</p>
+          <form action="/track" method="GET">
+            <input type="text" name="code" placeholder="SKT-XXXXXX" required style="text-transform:uppercase;">
+            <button type="submit" class="btn-primary">Cek Status</button>
+          </form>
+        </div>
+        """
+        if err == "notfound":
+            body = '<div style="background:#7f1d1d;color:#fecaca;font-size:12px;padding:10px;border-radius:8px;margin-bottom:12px;">Kode pesanan tidak ditemukan.</div>' + body
+        return web.Response(text=client_page("Status Pesanan", 0, body), content_type="text/html")
+    o = fetch_order(sqlite3.connect(DB_NAME), code=code)
+    if not o:
+        raise web.HTTPFound("/track?err=notfound")
+    step = STATUS_STEP.get(o["status"], 7)
+    actions = ""
+    if o["status"] == "pending_payment":
+        actions += '<a href="/payment?code=%s" class="btn-primary">Lihat Instruksi Pembayaran &rarr;</a>' % urlquote(o["code"])
+    if o["status"] in ("pending_payment", "rejected_payment"):
+        actions += '<a href="/upload-proof?code=%s" class="btn-secondary"><i class="fa-solid fa-upload"></i> Upload / Perbaiki Bukti Pembayaran</a>' % urlquote(o["code"])
+    if o["status"] == "active":
+        wa_guest = "https://wa.me/?text=" + urlquote(
+            "Undangan Pernikahan %s\n%s" % (o["couple_name"], invite_url_for(o["slug"])))
+        actions += ('<a href="%s" target="_blank" class="btn-wa"><i class="fa-brands fa-whatsapp"></i> Bagikan Link Undangan via WhatsApp</a>'
+                    '<button class="btn-secondary" onclick="navigator.clipboard.writeText(\'%s\');alert(\'Link disalin!\');">Salin Link Undangan</button>'
+                    % (wa_guest, _escape(invite_url_for(o["slug"]))))
+    if o["status"] == "expired":
+        admin_wa = "6285156918852"
+        actions += '<a href="https://wa.me/%s?text=%s" class="btn-wa"><i class="fa-brands fa-whatsapp"></i> Hubungi Admin untuk Perpanjangan</a>' % (
+            admin_wa, urlquote("Halo admin, undangan %s (%s) sudah EXPIRED. Saya ingin memperpanjang paket." % (o["couple_name"], o["code"])))
+    body = """
+    <div class="section-title">Status Pesanan Anda</div>
+    %s%s
+    <a href="/" class="btn-secondary">Kembali ke Beranda</a>
+    """ % (order_status_card(o), actions)
+    return web.Response(text=client_page("Status Pesanan", step, body), content_type="text/html")
+
+async def handle_my_orders(request):
+    """Daftar pesanan via nomor WhatsApp."""
+    phone = (request.query.get("phone") or "").strip()
+    list_html = ""
+    if phone:
+        conn = sqlite3.connect(DB_NAME)
+        rows = conn.execute('SELECT code, slug, couple_name, amount, status, expires_at FROM orders WHERE whatsapp LIKE ? ORDER BY id DESC LIMIT 20',
+                            ("%" + re.sub(r"\D", "", phone)[-8:] + "%",)).fetchall()
+        conn.close()
+        if rows:
+            for r in rows:
+                pill = '<span class="status-pill st-%s">%s</span>' % (r[4], _escape(ORDER_STATUS_LABEL.get(r[4], r[4])))
+                list_html += ('<a href="/track?code=%s" style="display:block;text-decoration:none;">'
+                              '<div class="o-row"><span>%s<br><small style="color:#71717a;">%s</small></span><strong>%s</strong></div></a>') % (
+                              urlquote(r[0]), _escape(r[2]), _escape(r[0]), pill)
+        else:
+            list_html = '<p style="font-size:11px;color:#71717a;text-align:center;padding:15px;">Belum ada pesanan untuk nomor ini.</p>'
+    body = """
+    <div class="section-title">Pesanan Saya</div>
+    <div class="order-card">
+      <h3>Cari dengan Nomor WhatsApp</h3>
+      <form action="/my-orders" method="GET">
+        <input type="tel" name="phone" placeholder="08123456789" required value="%s">
+        <button type="submit" class="btn-primary">Tampilkan Pesanan</button>
+      </form>
+    </div>
+    <div class="order-card">%s</div>
+    """ % (_escape(phone), list_html or '<p style="font-size:11px;color:#71717a;text-align:center;padding:10px;">Masukkan nomor WhatsApp yang dipakai saat memesan.</p>')
+    return web.Response(text=client_page("Pesanan Saya", 0, body), content_type="text/html")
+
+async def handle_invite_subdomain(request):
+    """Melayani https://[nama-pasangan].invite.sukamoto.web.id (via wildcard DNS+TLS).
+    Jika subdomain belum mengarah ke app, tetap tersedia fallback /u/<slug>."""
+    refresh_expired_orders()
+    host = (request.headers.get("Host") or "").split(":")[0].lower()
+    slug = ""
+    if host.endswith("." + INVITE_DOMAIN.lower()):
+        slug = host[: -len(INVITE_DOMAIN) - 1]
+    if not slug:
+        slug = request.match_info.get("slug", "")
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE slug = ?", (slug,))
+    row = cur.fetchone()
+    o = dict(zip([c[0] for c in cur.description], row)) if row else None
+    html_out = None
+    if o:
+        if o["status"] in ("active",):
+            cur.execute("SELECT html_code FROM templates WHERE id = ?", (o["template_id"],))
+            trow = cur.fetchone()
+            html_out = render_invitation_html(trow[0] if trow else "", o)
+        elif o["status"] == "expired":
+            html_out = _closed_page(o["couple_name"], "Masa aktif undangan ini sudah berakhir (EXPIRED).", o)
+        else:
+            html_out = _closed_page(o["couple_name"], "Undangan ini masih dalam proses pembuatan oleh tim SUKA MOTO. Mohon tunggu konfirmasi dari pemilik acara.", o)
+    else:
+        html_out = _closed_page("Undangan", "Link undangan tidak ditemukan / belum aktif.", None)
+    conn.close()
+    return web.Response(text=html_out, content_type="text/html")
+
+def _closed_page(couple, reason, o):
+    countdown = ""
+    if o and o.get("event_date"):
+        try:
+            d = _dt.date.fromisoformat(o["event_date"]) - _dt.date.today()
+            if d.days > 0:
+                countdown = "<p style='color:#a1a1aa;font-size:13px;'>Menuju hari Bahagia: <b style='color:#fbbf24;'>%d hari</b></p>" % d.days
+        except Exception:
+            pass
+    return """<!DOCTYPE html><html lang="id"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Undangan %s</title>
+<link href="https://fonts.googleapis.com/css2?family=Alex+Brush&family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#09090b;color:#f4f4f5;font-family:'Plus Jakarta Sans',sans-serif;text-align:center;}
+.c{max-width:380px;padding:40px 24px;background:#121215;border:1px solid #27272a;border-radius:18px;}
+.script{font-family:'Alex Brush',cursive;font-size:40px;color:#fbbf24;}
+.btn{display:inline-block;margin-top:18px;background:#22c55e;color:#fff;font-weight:700;padding:10px 20px;border-radius:8px;text-decoration:none;font-size:13px;}</style></head>
+<body><div class="c"><div class="script">The Wedding of</div><h1 style="font-size:20px;margin:6px 0 14px;">%s</h1>
+<div style="font-size:40px;">&#127886;</div>%s
+<p style="font-size:13px;color:#d4d4d8;line-height:1.6;margin-top:12px;">%s</p>
+<a class="btn" href="https://%s"><i class="fa-solid fa-heart"></i> Info &amp; Pembuatan Undangan</a>
+<p style="font-size:10px;color:#71717a;margin-top:16px;">Powered by SUKA MOTO Invitation</p></div></body></html>""" % (
+        _escape(couple), _escape(couple), countdown, _escape(reason), _escape(INVITE_DOMAIN))
 
 LOGIN_PAGE_HTML = """<!DOCTYPE html>
 <html lang="id">
@@ -729,7 +1586,7 @@ async def handle_template_action(request):
                     <div style="font-size: 11px; color: #a1a1aa; margin-bottom: 20px;"><i class="fa-regular fa-clock"></i> {tdur}</div>
 
                     <a href="/demo?id={tmpl_id}" class="btn-demo" target="_blank"><i class="fa-solid fa-eye"></i> Lihat Demo Template</a>
-                    <a href="/editor?id={tmpl_id}" class="btn-build"><i class="fa-solid fa-wand-magic-sparkles"></i> Buat Undangan Ini</a>
+                    <a href="/form?template_id={tmpl_id}" class="btn-build"><i class="fa-solid fa-wand-magic-sparkles"></i> Buat Undangan Ini</a>
                 </div>
             </div>
             {FOOTER_HTML}
@@ -951,6 +1808,132 @@ async def handle_guestbook(request):
 async def handle_admin(request):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+
+    # ---- Laporan pesanan client (flow [6]-[13]) ----
+    pending_orders = cursor.execute(
+        "SELECT id, code, slug, couple_name, whatsapp, amount, status, template_id, proof_filename, event_date "
+        "FROM orders WHERE status IN ('pending_payment','awaiting_verification','rejected_payment') ORDER BY id DESC"
+    ).fetchall()
+    all_orders = cursor.execute(
+        "SELECT id, code, slug, couple_name, whatsapp, amount, status, expires_at FROM orders ORDER BY id DESC LIMIT 100"
+    ).fetchall()
+    new_reports = sum(1 for r in pending_orders if r[6] == "awaiting_verification")
+    csrf_tok = make_csrf_token((get_admin(request) or {}).get("id", 0))
+    notif_script = """
+    <script>
+      var ADMIN_CSRF = "%s";
+      function notifyBrowser(title, body) {
+        if (!("Notification" in window)) return;
+        if (Notification.permission === "granted") { new Notification(title, { body: body }); }
+        else if (Notification.permission !== "denied") {
+          Notification.requestPermission().then(function (p) {
+            if (p === "granted") new Notification(title, { body: body });
+          });
+        }
+      }
+      async function checkNewReports() {
+        try {
+          var res = await fetch("/admin/orders/pending?json=1");
+          if (!res.ok) return;
+          var data = await res.json();
+          var last = parseInt(localStorage.getItem("sm_last_order_id") || "0");
+          var fresh = data.orders.filter(function (o) { return o.id > last && o.status === "awaiting_verification"; });
+          if (fresh.length) {
+            notifyBrowser("Laporan Pesanan Baru - SUKA MOTO",
+              fresh.length + " bukti pembayaran menunggu verifikasi. Terbaru: " + fresh[0].couple_name + " (" + fresh[0].code + ")");
+            var badge = document.getElementById("report-badge");
+            if (badge) { badge.textContent = data.count; badge.style.display = "inline-block"; }
+          }
+          var maxId = data.orders.reduce(function (m, o) { return Math.max(m, o.id); }, last);
+          localStorage.setItem("sm_last_order_id", String(maxId));
+        } catch (e) {}
+      }
+      checkNewReports();
+      setInterval(checkNewReports, 20000);
+    </script>""" % _escape(csrf_tok)
+
+    report_rows = ""
+    for (oid, code, slug, cname, wa, amount, status, tid, proof, evdate) in pending_orders:
+        pill = '<span class="status-pill st-%s">%s</span>' % (status, _escape(ORDER_STATUS_LABEL.get(status, status)))
+        proof_html = ("<a href='/static_uploads/%s' target='_blank' style='color:#fbbf24;font-size:10px;'>[Lihat Bukti]</a>"
+                      % urlquote(os.path.basename(proof))) if proof else "<span style='color:#71717a;font-size:10px;'>belum ada bukti</span>"
+        wa_report = "https://wa.me/" + re.sub(r"\D", "", wa or "") + "?text=" + urlquote(
+            "Halo %s, pesanan undangan %s (kode %s) dengan nominal %s sudah kami terima dan sedang kami proses." % (cname, cname, code, amount))
+        wa_link_ok = wa_admin_link((oid, code, slug, cname, wa, amount, status), approve=True)
+        wa_link_no = wa_admin_link((oid, code, slug, cname, wa, amount, status), approve=False)
+        actions = ""
+        if status == "awaiting_verification":
+            actions += """
+            <form action="/admin/order_action" method="POST" style="display:inline;">
+                <input type="hidden" name="csrf_token" value="%s">
+                <input type="hidden" name="order_id" value="%d"><input type="hidden" name="action" value="verify">
+                <button type="submit" style="background:#34d399;color:#000;border:none;padding:4px 8px;border-radius:4px;font-size:10px;font-weight:bold;cursor:pointer;">&#10003; Verifikasi</button>
+            </form>
+            <form action="/admin/order_action" method="POST" style="display:inline;">
+                <input type="hidden" name="csrf_token" value="%s">
+                <input type="hidden" name="order_id" value="%d"><input type="hidden" name="action" value="reject">
+                <button type="submit" style="background:#ef4444;color:#fff;border:none;padding:4px 8px;border-radius:4px;font-size:10px;font-weight:bold;cursor:pointer;">&#10060; Tolak</button>
+            </form>""" % (_escape(csrf_tok), oid, _escape(csrf_tok), oid)
+        if status == "pending_payment":
+            actions += """
+            <form action="/admin/order_action" method="POST" style="display:inline;">
+                <input type="hidden" name="csrf_token" value="%s">
+                <input type="hidden" name="order_id" value="%d"><input type="hidden" name="action" value="mark_paid">
+                <button type="submit" style="background:#3b82f6;color:#fff;border:none;padding:4px 8px;border-radius:4px;font-size:10px;font-weight:bold;cursor:pointer;">Uang Masuk (tanpa bukti)</button>
+            </form>""" % (_escape(csrf_tok), oid)
+        if status in ("verified",):
+            actions += """
+            <form action="/admin/order_action" method="POST" style="display:inline;">
+                <input type="hidden" name="csrf_token" value="%s">
+                <input type="hidden" name="order_id" value="%d"><input type="hidden" name="action" value="process">
+                <button type="submit" style="background:#a855f7;color:#fff;border:none;padding:4px 8px;border-radius:4px;font-size:10px;font-weight:bold;cursor:pointer;">Proses Undangan</button>
+            </form>""" % (_escape(csrf_tok), oid)
+        report_rows += """
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:8px;"><b style="color:#fff;font-size:11px;">%s</b><br>
+                <span style="font-size:9px;color:#fbbf24;">%s</span><br>%s<br>
+                <span style="font-size:9px;color:#71717a;">WA: %s &bull; Acara: %s</span></td>
+            <td style="padding:8px;font-size:10px;color:#34d399;">%s</td>
+            <td style="padding:8px;">%s<br>%s</td>
+            <td style="padding:8px;white-space:nowrap;">%s
+                <div style="margin-top:4px;display:flex;gap:4px;flex-wrap:wrap;">
+                  <a href="%s" target="_blank" style="background:#22c55e;color:#fff;padding:3px 6px;border-radius:4px;font-size:9px;text-decoration:none;font-weight:bold;">WA Konfirmasi</a>
+                  <a href="%s" target="_blank" style="background:#27272a;color:#fff;padding:3px 6px;border-radius:4px;font-size:9px;text-decoration:none;">WA Link Aktif</a>
+                  <a href="%s" target="_blank" style="background:#27272a;color:#fbbf24;padding:3px 6px;border-radius:4px;font-size:9px;text-decoration:none;">WA Tolak</a>
+                </div>
+            </td>
+        </tr>""" % (_escape(cname), _escape(code), pill, _escape(wa), _escape(format_date_id(evdate)),
+                    _escape(amount), proof_html, _escape(invite_url_for(slug)), actions,
+                    wa_report if wa else "#", wa_link_ok, wa_link_no)
+    if not report_rows:
+        report_rows = "<tr><td colspan='4' style='text-align:center;color:#71717a;padding:10px;font-size:11px;'>Tidak ada pesanan yang menunggu tindakan.</td></tr>"
+
+    archive_rows = ""
+    for (oid, code, slug, cname, wa, amount, status, exp) in all_orders:
+        pill = '<span class="status-pill st-%s">%s</span>' % (status, _escape(ORDER_STATUS_LABEL.get(status, status)))
+        act_btn = ""
+        if status == "processing":
+            act_btn = """<form action="/admin/order_action" method="POST" style="display:inline;">
+                <input type="hidden" name="csrf_token" value="%s">
+                <input type="hidden" name="order_id" value="%d"><input type="hidden" name="action" value="activate">
+                <button type="submit" style="background:#34d399;color:#000;border:none;padding:4px 8px;border-radius:4px;font-size:9px;font-weight:bold;cursor:pointer;">&#9654; AKTIFKAN</button></form>""" % (_escape(csrf_tok), oid)
+        elif status == "active":
+            act_btn = """<form action="/admin/order_action" method="POST" style="display:inline;">
+                <input type="hidden" name="csrf_token" value="%s">
+                <input type="hidden" name="order_id" value="%d"><input type="hidden" name="action" value="expire">
+                <button type="submit" style="background:#71717a;color:#fff;border:none;padding:4px 8px;border-radius:4px;font-size:9px;cursor:pointer;">Nonaktifkan</button></form>""" % (_escape(csrf_tok), oid)
+        archive_rows += """
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:6px;font-size:10px;"><b>%s</b><br><span style="color:#71717a;">%s</span></td>
+            <td style="padding:6px;font-size:10px;">%s</td>
+            <td style="padding:6px;font-size:10px;color:#34d399;">%s</td>
+            <td style="padding:6px;font-size:10px;">%s</td>
+            <td style="padding:6px;">%s</td>
+        </tr>""" % (_escape(cname), _escape(code), pill, _escape(amount),
+                    _escape(exp or "-"), act_btn)
+    if not archive_rows:
+        archive_rows = "<tr><td colspan='5' style='text-align:center;color:#71717a;padding:10px;font-size:11px;'>Belum ada pesanan.</td></tr>"
+
     cursor.execute('SELECT id, name, subtitle FROM packages')
     pkgs = cursor.fetchall()
 
@@ -973,6 +1956,11 @@ async def handle_admin(request):
         current_homepage_html = ""
     # S0 SECURITY: escape saat masuk <textarea> (file disimpan apa adanya).
     current_homepage_esc = _escape(current_homepage_html)
+
+    # nilai pengaturan utk form admin
+    _adm_account = get_setting(cursor, "payment_account", "")
+    _adm_qris = get_setting(cursor, "payment_qris", "")
+    _adm_wa = get_setting(cursor, "admin_whatsapp", "")
 
     pkg_options = ""
     for pid, pname, _ in pkgs:
@@ -1052,16 +2040,51 @@ async def handle_admin(request):
             table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }}
             th {{ text-align: left; padding: 10px; border-bottom: 2px solid #3f3f46; color: #fbbf24; }}
             .section-box {{ background: #18181b; border: 1px solid #27272a; padding: 15px; border-radius: 10px; margin-bottom: 20px; }}
+            {ORDER_CSS}
         </style>
     </head>
     <body>
         <div class="wrap">
-            <h2 style="font-size: 16px; margin-bottom: 5px;">Panel Kontrol Admin</h2>
+            <h2 style="font-size: 16px; margin-bottom: 5px;">Panel Kontrol Admin
+              <span id="report-badge" style="display:none;background:#ef4444;color:#fff;font-size:10px;border-radius:99px;padding:2px 8px;vertical-align:middle;">0</span>
+            </h2>
             <p style="font-size:11px; color:#a1a1aa; margin-bottom:20px;">
                 <a href="/" style="color:#fbbf24; text-decoration:none;">&larr; Kembali ke Beranda</a>
                 &nbsp;|&nbsp; Login sebagai: <b style="color:#34d399;">{_escape((get_admin(request) or {}).get('username', ''))}</b>
                 &nbsp;|&nbsp; <a href="/admin/logout" style="color:#ef4444; text-decoration:none;">Logout</a>
             </p>
+
+            <div class="section-box" style="border-left:3px solid #fbbf24;">
+                <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">Laporan Pesanan Client (Perlu Tindakan)
+                    <span style="background:#27272a;color:#fff;font-size:10px;border-radius:99px;padding:2px 8px;">{len(pending_orders)}</span></h3>
+                <p style="font-size:10px;color:#71717a;margin-bottom:8px;">Notifikasi browser aktif (polling tiap 20 detik). Alur: Verifikasi/Tolak pembayaran &rarr; Proses &rarr; AKTIFKAN &rarr; kirim link ke client via tombol WhatsApp.</p>
+                <table>
+                    <tr><th>Pesanan / Pasangan</th><th>Nominal</th><th>Bukti &amp; Link Subdomain</th><th>Aksi Admin</th></tr>
+                    {report_rows}
+                </table>
+            </div>
+
+            <div class="section-box">
+                <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">Semua Pesanan (Timeline [7]-[13])</h3>
+                <table>
+                    <tr><th>Pasangan / Kode</th><th>Status</th><th>Nominal</th><th>Expires</th><th>Aksi</th></tr>
+                    {archive_rows}
+                </table>
+            </div>
+
+            <div class="section-box">
+                <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">Pengaturan Pembayaran &amp; WhatsApp Admin</h3>
+                <form action="/admin/save_settings" method="POST">
+                    {csrf_field(request)}
+                    <label style="font-size:11px;color:#a1a1aa;display:block;">Rekening Bank</label>
+                    <input type="text" name="payment_account" value="{_escape(_adm_account)}">
+                    <label style="font-size:11px;color:#a1a1aa;display:block;margin-top:6px;">QRIS / E-Wallet</label>
+                    <input type="text" name="payment_qris" value="{_escape(_adm_qris)}">
+                    <label style="font-size:11px;color:#a1a1aa;display:block;margin-top:6px;">Nomor WhatsApp Admin (untuk notifikasi/link laporan)</label>
+                    <input type="text" name="admin_whatsapp" value="{_escape(_adm_wa)}">
+                    <button type="submit" class="btn-save">Simpan Pengaturan</button>
+                </form>
+            </div>
 
             <div class="section-box">
                 <h3 style="font-size:13px; margin-bottom:8px; color:#fbbf24;">Edit File Fisik Halaman Beranda (homepage.html)</h3>
@@ -1136,11 +2159,82 @@ async def handle_admin(request):
             document.querySelectorAll('.auto-full-url').forEach(input => {{
                 input.value = window.location.origin + input.getAttribute('data-url');
             }});
+            {notif_script}
         </script>
     </body>
     </html>
     """
     return web.Response(text=admin_html, content_type='text/html')
+
+async def handle_admin_orders_pending(request):
+    """Endpoint JSON untuk polling notifikasi browser admin."""
+    refresh_expired_orders()
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT id, code, couple_name, whatsapp, amount, status FROM orders "
+                "WHERE status IN ('pending_payment','awaiting_verification','rejected_payment') ORDER BY id DESC LIMIT 50")
+    cols = [c[0] for c in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    conn.close()
+    return web.json_response({"count": len(rows), "orders": rows})
+
+async def handle_admin_order_action(request):
+    """Konfirmasi admin: verify/reject/mark_paid/process/activate/expire + catat timeline."""
+    data = await request.post()
+    adm = get_admin(request)
+    if not check_csrf_token(adm["id"], data.get("csrf_token", "")):
+        raise web.HTTPForbidden(text="CSRF token tidak valid. Silakan login ulang.")
+    oid = data.get("order_id")
+    action = data.get("action", "")
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE id = ?", (oid,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise web.HTTPFound("/admin")
+    o = dict(zip([c[0] for c in cur.description], row))
+    status = o["status"]
+    if action == "verify" and status == "awaiting_verification":
+        set_order_status(cur, o["id"], "verified", "Bukti pembayaran diverifikasi admin " + str(adm.get("username")))
+    elif action == "reject" and status == "awaiting_verification":
+        reason = (data.get("reason") or "").strip()[:200] or "Data transfer tidak cocok dengan nominal/kode pesanan."
+        cur.execute("UPDATE orders SET status='rejected_payment', reject_reason=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (reason, o["id"]))
+        add_order_event(cur, o["id"], "rejected_payment", "Ditolak admin: " + reason)
+    elif action == "mark_paid" and status == "pending_payment":
+        set_order_status(cur, o["id"], "verified", "Uang masuk dikonfirmasi admin (tanpa upload bukti)")
+    elif action == "process" and status == "verified":
+        set_order_status(cur, o["id"], "processing", "Undangan masuk antrean produksi")
+    elif action == "activate" and status in ("processing", "verified"):
+        cur.execute('''SELECT t.duration, p.duration, o.event_date, o.amount FROM orders o
+                       LEFT JOIN templates t ON t.id = o.template_id
+                       LEFT JOIN packages p ON p.id = o.package_id WHERE o.id = ?''', (o["id"],))
+        exp = compute_expires_at(cur.fetchone())
+        cur.execute("UPDATE orders SET status='active', expires_at=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (exp, o["id"]))
+        add_order_event(cur, o["id"], "active", "Undangan diaktifkan -> " + invite_url_for(o["slug"]) + " (exp " + exp + ")")
+    elif action == "expire" and status == "active":
+        set_order_status(cur, o["id"], "expired", "Dinonaktifkan manual oleh admin")
+    conn.commit()
+    conn.close()
+    raise web.HTTPFound("/admin")
+
+async def handle_admin_save_settings(request):
+    data = await request.post()
+    adm = get_admin(request)
+    if not check_csrf_token(adm["id"], data.get("csrf_token", "")):
+        raise web.HTTPForbidden(text="CSRF token tidak valid. Silakan login ulang.")
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    for key in ("payment_account", "payment_qris", "admin_whatsapp"):
+        val = (data.get(key) or "").strip()[:200]
+        if val:
+            cur.execute('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                        (key, val))
+    conn.commit()
+    conn.close()
+    raise web.HTTPFound("/admin")
 
 async def handle_update_homepage(request):
     data = await request.post()
@@ -1320,6 +2414,23 @@ app.router.add_post('/admin/add_pkg', handle_add_pkg)
 app.router.add_post('/admin/delete_pkg', handle_delete_pkg)
 app.router.add_post('/admin/add_tmpl', handle_add_tmpl)
 app.router.add_post('/admin/delete_tmpl', handle_delete_tmpl)
+
+# === ROUTING ALUR CLIENT (flow [1]-[13]) ===
+app.router.add_get('/start', handle_start)                       # [2] Pilih Paket
+app.router.add_get('/form', handle_form)                         # [4] Isi Data Undangan
+app.router.add_post('/preview', handle_preview)                  # [5] Preview Undangan
+app.router.add_post('/submit-order', handle_submit_order)        # [6] Kirim Pesanan -> Order dibuat
+app.router.add_get('/payment', handle_payment)                   # [7] Pembayaran: nominal, rekening/QRIS, kode unik
+app.router.add_get('/upload-proof', handle_upload_proof)         # [8] Upload Bukti Pembayaran
+app.router.add_post('/upload-proof', handle_upload_proof_post)   # [8] terkirim -> [9] Menunggu Verifikasi
+app.router.add_get('/track', handle_track)                       # status pesanan [7]-[13] via kode unik
+app.router.add_get('/my-orders', handle_my_orders)               # daftar pesanan via nomor WhatsApp
+app.router.add_get('/u/{slug}', handle_invite_subdomain)         # fallback /undangan tanpa wildcard subdomain
+
+# === ADMIN ORDER PIPELINE (laporan + konfirmasi + kirim link WA) ===
+app.router.add_get('/admin/orders/pending', handle_admin_orders_pending)   # polling notifikasi browser
+app.router.add_post('/admin/order_action', handle_admin_order_action)      # verify/reject/process/activate/expire
+app.router.add_post('/admin/save_settings', handle_admin_save_settings)    # rekening/QRIS/WA admin
 
 if __name__ == '__main__':
     web.run_app(app, host='0.0.0.0', port=9000)
