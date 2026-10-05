@@ -1,5 +1,6 @@
-# Logs and temp files
-server.log
+# Compiled files
+__pycache__/
+*.pyc
 
-# Environment/Sensitive data (if cookies.txt is considered sensitive/generated)
-cookies.txt
+# Database files
+*.db
