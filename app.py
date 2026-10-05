@@ -12,9 +12,21 @@ from urllib.parse import quote as urlquote
 import aiohttp
 from aiohttp import web
 
+# --- Template Engine V1 (additive): renderer/ + services/ ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in os.sys.path:
+    os.sys.path.insert(0, BASE_DIR)
+from renderer import renderer as engine  # noqa: E402  (dispatch render_template/load_template)
+from renderer.validator import validate_template, validate_photo_value  # noqa: E402
+from services import wedding_service, order_service, generation_service, template_service, package_service  # noqa: E402
+
 DB_NAME = "undangan.db"
 UPLOAD_DIR = "./static_uploads"
 HOMEPAGE_FILE = "homepage.html"
+PROOF_DIR = os.path.join(BASE_DIR, "payment_proofs")  # privat: TIDAK dipublik via static route
+GENERATED_ROOT = os.path.join(BASE_DIR, "generated", "weddings")
+os.makedirs(PROOF_DIR, exist_ok=True)
+os.makedirs(GENERATED_ROOT, exist_ok=True)
 
 # ============================================================
 # S0 SECURITY: konfigurasi via environment variable
@@ -282,6 +294,23 @@ def init_db():
         cursor.execute("ALTER TABLE templates ADD COLUMN duration TEXT DEFAULT ''")
     if 'is_top10' not in columns:
         cursor.execute("ALTER TABLE templates ADD COLUMN is_top10 INTEGER DEFAULT 0")
+    # ---- Template Engine V1: migrasi ADDITIVE (jangan hapus kolom lama) ----
+    # render_mode: 'legacy' (template lama) | 'placeholder' (template baru dgn {{key}})
+    # template_path boleh NULL selama html_code masih source of truth.
+    if 'render_mode' not in columns:
+        cursor.execute("ALTER TABLE templates ADD COLUMN render_mode TEXT NOT NULL DEFAULT 'legacy'")
+    if 'template_key' not in columns:
+        cursor.execute("ALTER TABLE templates ADD COLUMN template_key TEXT")
+    if 'template_path' not in columns:
+        cursor.execute("ALTER TABLE templates ADD COLUMN template_path TEXT")
+    if 'status' not in columns:
+        cursor.execute("ALTER TABLE templates ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    cursor.close()
+    conn.close()
+    # weddings + payment_state (tabel baru, additive; idempoten)
+    template_service.migrate_additive(DB_NAME)
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
 
     cursor.execute('SELECT COUNT(*) FROM packages')
     if cursor.fetchone()[0] == 0:
@@ -475,10 +504,39 @@ def format_date_id(iso):
 
 def render_invitation_html(html_code, o):
     """Injeksi data undangan ke dalam html_code template.
-    Mendukung 2 gaya:
+
+    LEGACY (flow lama /preview & /u/{slug}): mendukung 2 gaya:
       1) token {{nama_field}} di dalam HTML template
       2) atribut data-field="nama_field" pada elemen (untuk template lama contenteditable)
+
+    ENGINE V1: bila ada pasangan wedding <-> order <-> template dengan
+    render_mode='placeholder', gunakan renderer kanonik (engine.render_template)
+    agar PREVIEW client == GENERATION production (one renderer).
     """
+    # --- jalur Template Engine V1 (additive; fallback ke perilaku lama) ---
+    try:
+        _tid = o.get("template_id")
+        if _tid is not None and o.get("_use_engine"):
+            _conn = sqlite3.connect(DB_NAME)
+            try:
+                _tmpl = engine.load_template(_conn, _tid)
+                if _tmpl and (_tmpl.get("render_mode") or "legacy") == "placeholder":
+                    _w = wedding_service.get_wedding_by_order(_conn, o["id"]) if o.get("id") else None
+                    if _w is None:
+                        _w = {
+                            "groom_name": o.get("groom_name", ""), "bride_name": o.get("bride_name", ""),
+                            "event_date": o.get("event_date", ""), "event_time": o.get("event_time", ""),
+                            "venue": o.get("venue_name", ""), "address": o.get("venue_address", ""),
+                            "couple_photo": o.get("photo_url", ""),
+                        }
+                    return engine.render_template(_tmpl, wedding_service.to_renderer_data(_w))
+            finally:
+                _conn.close()
+    except engine.RenderError:
+        raise
+    except Exception as _e:  # jangan jatuhkan flow lama karena error engine
+        print("[renderer-v1] fallback legacy render:", _e)
+
     tokens = {
         "couple_name": o["couple_name"],
         "groom_name": o["groom_name"],
@@ -726,55 +784,144 @@ def fetch_order(conn, code=None, oid=None):
         return None
     return dict(zip([c[0] for c in cur.description], row))
 
+TIER_BADGE = {"silver": ("&#129352; SILVER", "#3f3f46", "#e5e7eb"),
+              "gold": ("&#129351; GOLD", "#92400e", "#fde68a"),
+              "platinum": ("&#128081; PLATINUM VIP", "#581c87", "#e9d5ff")}
+
 async def handle_start(request):
-    """[2] Pilih Paket."""
+    """[2] Pilih Paket — hirarki Silver / Gold / Platinum VIP + rincian fitur."""
     conn = sqlite3.connect(DB_NAME)
     pkgs = conn.execute('SELECT id, name, subtitle, image_url FROM packages ORDER BY id').fetchall()
+    feats = package_service.load_features(conn)
     conn.close()
-    pkg_meta = {1: ("Silver", "Aktif 30 hari"), 2: ("Gold", "Aktif 90 hari"), 3: ("Platinum VIP", "Aktif 6 bulan")}
+    default_dur = {"silver": "Aktif 30 hari", "gold": "Aktif 90 hari", "platinum": "Aktif 6 bulan"}
     cards = ""
     for pid, name, sub, img in pkgs:
-        tag, dur = pkg_meta.get(pid, (name, "Paket pilihan"))
+        tier = package_service.tier_of_package((pid, name, sub)) or "silver"
+        f = feats.get(tier) or {}
+        tag, badge_bg, badge_fg = TIER_BADGE[tier]
+        dur = f.get("duration") or default_dur.get(tier, "Paket pilihan")
+        positioning = f.get("positioning") or sub
+        next_label = ("Konsultasikan Request &rarr;" if tier == "platinum"
+                      else "Lihat Koleksi Template &rarr;")
         cards += """
-        <a href="/templates?package_id=%d&from=start" style="background:#18181b;border:1px solid #27272a;border-radius:14px;overflow:hidden;text-decoration:none;display:block;margin-bottom:12px;">
-          <img src="%s" alt="" style="width:100%%;height:110px;object-fit:cover;display:block;">
+        <a href="/templates?package_id=%d&from=start" style="background:#18181b;border:1px solid #27272a;border-radius:14px;overflow:hidden;text-decoration:none;display:block;margin-bottom:6px;">
+          <img src="%s" alt="" style="width:100%%%%;height:110px;object-fit:cover;display:block;">
           <div style="padding:12px;">
             <div style="display:flex;justify-content:space-between;align-items:center;">
               <h3 style="font-size:13px;color:#fff;font-weight:800;">%s</h3>
-              <span style="font-size:9px;background:#3f3f46;color:#fbbf24;padding:2px 8px;border-radius:99px;font-weight:bold;">%s</span>
+              <span style="font-size:9px;background:%s;color:%s;padding:2px 8px;border-radius:99px;font-weight:bold;">%s</span>
             </div>
-            <p style="font-size:11px;color:#a1a1aa;margin:4px 0 8px;">%s</p>
-            <div style="font-size:11px;color:#34d399;font-weight:bold;"><i class="fa-regular fa-clock"></i> %s &bull; Lihat Koleksi Template &rarr;</div>
+            <p style="font-size:11px;color:#fbbf24;font-style:italic;margin:6px 0 2px;">&ldquo;%s&rdquo;</p>
+            <p style="font-size:11px;color:#a1a1aa;margin:2px 0 8px;">%s</p>
+            <div style="font-size:11px;color:#34d399;font-weight:bold;"><i class="fa-regular fa-clock"></i> %s &bull; %s</div>
           </div>
-        </a>""" % (pid, _escape(img), _escape(name), _escape(tag), _escape(sub), _escape(dur))
+        </a>%s""" % (pid, _escape(img), _escape(name), badge_bg, badge_fg, tag,
+                     _escape(positioning), _escape(sub), _escape(dur), next_label,
+                     package_service.tier_feature_card_html(tier, feats))
+    banner = """
+    <div class="plat-banner">
+      <h3>&#128081; PLATINUM VIP &mdash; Bukan sekadar template.</h3>
+      <p>Lo punya request tema khusus? Misalnya <b>&ldquo;kerajaan Jawa tapi modern&rdquo;</b>?
+      Kalau Silver <b>&#10005;</b> tidak bisa dan Gold hanya <b>&#9888;</b> pilih template terdekat,
+      Platinum <b>&#10004;</b> kami buatkan design-nya dari nol: custom layout, animasi, ilustrasi,
+      typography, sampai loading screen.</p>
+    </div>"""
     body = """
     <div class="section-title">Langkah 2 &mdash; Pilih Paket</div>
     <div class="order-card" style="border-left:3px solid #fbbf24;">
       <h3>Paket Undangan</h3>
       <p style="font-size:11px;color:#a1a1aa;line-height:1.6;">Setelah memilih paket, Anda akan diarahkan ke halaman
       <b>Kirim Pesanan</b> untuk menyelesaikan pembayaran. Link undangan memakai subdomain
-      <span style="color:#34d399;">nama-pasangan.%s</span>.</p>
+      <span style="color:#34d399;">nama-pasangan.%s</span>. Klik <b>Rincian Fitur</b> pada tiap paket untuk melihat lengkap apa saja yang didapat.</p>
     </div>
     %s
+    %s
+    %s
     <a href="/" class="btn-secondary">&larr; Kembali ke Beranda</a>
-    """ % (_escape(INVITE_DOMAIN), cards)
-    return web.Response(text=client_page("Pilih Paket", 2, body), content_type="text/html")
+    """ % (_escape(INVITE_DOMAIN), banner, cards, package_service.comparison_table_html(feats))
+    return web.Response(text=client_page("Pilih Paket", 2, body, extra_head="<style>%s</style>" % package_service.TIER_CSS),
+                        content_type="text/html")
 
 async def handle_form(request):
-    """[4] Isi Data Undangan."""
+    """[4] Isi Data Undangan — field menyesuaikan tier paket (Silver/Gold/Platinum)."""
     tmpl_id = request.query.get("template_id", "")
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute('SELECT t.id, t.name, t.price, t.discount, t.duration, p.id, p.name '
+    cur.execute('SELECT t.id, t.name, t.price, t.discount, t.duration, p.id, p.name, p.subtitle '
                 'FROM templates t JOIN packages p ON t.package_id = p.id WHERE t.id = ?', (tmpl_id,))
     tmpl = cur.fetchone()
     conn.close()
     if not tmpl:
         raise web.HTTPFound("/start")
-    tid, tname, tprice, tdisc, tdur, pid, pname = tmpl
+    tid, tname, tprice, tdisc, tdur, pid, pname, psub = tmpl
+    tier = package_service.tier_of_package((pid, pname, psub)) or "silver"
     saved = request.query  # nilai kembali jika validasi gagal
     def v(key, default=""):
         return _escape(saved.get(key, default))
+
+    # --- Field per tier (additive; nama input lama tidak berubah) ---
+    parents_block = ""      # Silver+ : nama orang tua
+    quote_block = ""        # Silver+ : quote/doa
+    story_block = ""        # Silver+ : couple story singkat
+    extra_event_block = ""  # Gold+   : multiple event (Ngunduh Mantu / Bride-Groom Event)
+    color_block = ""        # Silver boleh warna tertentu; Gold customisasi lebih luas
+    plat_block = ""         # Platinum: request full custom (design dari nol)
+    if tier in ("silver", "gold", "platinum"):
+        parents_block = """
+      <h3 style="margin-top:16px;">Orang Tua &amp; Quote</h3>
+      <label class="fld">Nama Orang Tua Mempelai Pria</label>
+      <input type="text" name="groom_parents" placeholder="Bapak Budi &amp; Ibu Sari" value="%(groom_parents)s">
+      <label class="fld">Nama Orang Tua Mempelai Wanita</label>
+      <input type="text" name="bride_parents" placeholder="Bapak Ahmad &amp; Ibu Fatma" value="%(bride_parents)s">
+      <label class="fld">Quote / Doa Pembuka</label>
+      <textarea name="quote_promise" rows="2" placeholder="Dan di antara tanda-tanda kekuasaan-Nya...">%(quote_promise)s</textarea>"""
+        story_block = """
+      <label class="fld">Cerita Singkat Kami (Couple Story)</label>
+      <textarea name="couple_story" rows="3" placeholder="Berawal dari... akhirnya sampai ke pelaminan.">%(couple_story)s</textarea>"""
+        color_block = """
+      <label class="fld">Pilihan Warna Undangan %(color_hint)s</label>
+      <select name="theme_color">
+        <option value="ivory">Ivory Elegant</option>
+        <option value="sage">Sage Green</option>
+        <option value="dusty-rose">Dusty Rose</option>
+        <option value="gold">Gold Luxury</option>
+        <option value="navy">Midnight Navy</option>
+      </select>"""
+    if tier in ("gold", "platinum"):
+        extra_event_block = """
+      <h3 style="margin-top:16px;">Event Tambahan <span style="font-size:9px;color:#fbbf24;">(fitur GOLD: multiple event)</span></h3>
+      <label class="fld">Tanggal Ngunduh Mantu / Tasyakuran (opsional)</label>
+      <input type="date" name="ngunduh_date" value="%(ngunduh_date)s">
+      <label class="fld">Waktu &amp; Tempat Event Tambahan</label>
+      <input type="text" name="ngunduh_detail" placeholder="13.00 WIB - Halaman Gedung" value="%(ngunduh_detail)s">
+      <label class="fld">Bride / Groom Party Event (opsional)</label>
+      <input type="text" name="party_event" placeholder="Cth: Brid Shower 20 Nov, Pukul 15.00" value="%(party_event)s">"""
+    if tier == "platinum":
+        plat_block = """
+      <div class="plat-banner" style="margin-top:16px;">
+        <h3>&#128081; PLATINUM VIP &mdash; Full Custom Request</h3>
+        <p style="font-size:11px;">Lo punya request tema khusus? Misalnya <b>&ldquo;kerajaan Jawa tapi modern&rdquo;</b>?
+        Tuliskan di sini &mdash; tim kami yang <b>membuatkan design khusus dari nol</b> untuk undanganmu
+        (custom layout, animasi, ilustrasi, typography, loading screen, music experience).</p>
+        <label class="fld" style="color:#e9d5ff;margin-top:10px;">Request Tema / Design Khusus *</label>
+        <textarea name="custom_request" rows="4" required placeholder="Contoh: Aku mau temanya kerajaan Jawa tapi tetap modern, warnanya gold-black, ada animasi batik saat opening...">%(custom_request)s</textarea>
+        <label class="fld" style="color:#e9d5ff;">Referensi (link gambar / moodboard, opsional)</label>
+        <input type="url" name="custom_reference" placeholder="https://..." value="%(custom_reference)s">
+      </div>"""
+    else:
+        plat_block = """
+      <div class="order-card" style="border-left:3px solid #a855f7;margin-top:16px;padding:12px;">
+        <div style="font-size:11px;color:#d8b4fe;"><b>&#128081; Butuh design custom dari nol?</b><br>
+        Upgrade ke <b>PLATINUM VIP</b> dan tim kami buatkan template khusus sesuai request tema-mu.
+        <a href="/start" style="color:#fbbf24;font-weight:bold;">Lihat Paket Platinum &rarr;</a></div>
+      </div>"""
+
+    tier_badge_html = ""
+    tag, bg, fg = TIER_BADGE[tier]
+    tier_badge_html = '<span style="font-size:9px;background:%s;color:%s;padding:2px 8px;border-radius:99px;font-weight:bold;">%s</span>' % (bg, fg, tag)
+    color_hint = "(layout tetap sesuai template)" if tier == "silver" else "(bagian dari personalisasi premium)"
+
     body = """
     <div class="section-title">Langkah 4 &mdash; Isi Data Undangan</div>
     <div class="order-card" style="border-left:3px solid #34d399;">
@@ -782,11 +929,13 @@ async def handle_form(request):
         <span style="color:#a1a1aa;">Template Terpilih</span>
         <strong style="color:#fff;">%(tname)s <span style="color:#34d399;">(%(tprice)s)</span></strong>
       </div>
-      <div style="display:flex;justify-content:space-between;font-size:12px;margin-top:6px;">
-        <span style="color:#a1a1aa;">Paket / Durasi</span><strong style="color:#fff;">%(pname)s &bull; %(tdur)s</strong>
+      <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;margin-top:6px;">
+        <span style="color:#a1a1aa;">Paket / Durasi</span>
+        <strong style="color:#fff;display:flex;gap:6px;align-items:center;">%(pname)s &bull; %(tdur)s %(tierbadge)s</strong>
       </div>
+      <div style="font-size:10px;color:#71717a;margin-top:6px;">%(tierhint)s</div>
     </div>
-    <form action="/preview" method="POST" class="order-card">
+    <form action="/preview" method="POST" enctype="multipart/form-data" class="order-card">
       <input type="hidden" name="template_id" value="%(tid)s">
       <h3>Mempelai</h3>
       <label class="fld">Nama Pasangan ( utk link: nama-pasangan.%(dom)s ) *</label>
@@ -799,7 +948,7 @@ async def handle_form(request):
       <input type="text" name="groom_insta" placeholder="@username" value="%(groom_insta)s">
       <label class="fld">Instagram Wanita</label>
       <input type="text" name="bride_insta" placeholder="@username" value="%(bride_insta)s">
-
+      %(parents_block)s
       <h3 style="margin-top:16px;">Acara &amp; Lokasi</h3>
       <label class="fld">Tanggal Akad Nikah *</label>
       <input type="date" name="akkad_date" required value="%(akkad_date)s">
@@ -813,7 +962,9 @@ async def handle_form(request):
       <textarea name="venue_address" rows="2" required placeholder="Jl. ... , Kota ...">%(venue_address)s</textarea>
       <label class="fld">Link Lokasi Google Maps</label>
       <input type="url" name="maps_url" placeholder="https://maps.google.com/..." value="%(maps_url)s">
-
+      %(extra_event_block)s
+      %(color_block)s
+      %(story_block)s
       <h3 style="margin-top:16px;">Foto &amp; WhatsApp</h3>
       <label class="fld">Upload Foto Cover Mempelai (jpg/png/webp, maks 5 MB)</label>
       <input type="file" name="photo" accept=".jpg,.jpeg,.png,.webp,.gif" style="background:#121215;padding:6px;">
@@ -821,15 +972,25 @@ async def handle_form(request):
       <input type="tel" name="whatsapp" required placeholder="08123456789" value="%(whatsapp)s">
       <label class="fld">Pesan Pembuka Undangan</label>
       <textarea name="message" rows="2" placeholder="Tanpa mengurangi rasa hormat...">%(message)s</textarea>
+      %(plat_block)s
       <button type="submit" class="btn-primary"><i class="fa-regular fa-eye"></i> Lanjut ke Preview &rarr;</button>
     </form>
     <a href="/template-action?id=%(tid)s" class="btn-secondary">&larr; Ganti Template</a>
     """ % dict(dom=_escape(INVITE_DOMAIN), tid=tid, tname=_escape(tname), tprice=_escape(tprice),
-               pname=_escape(pname), tdur=_escape(tdur or "-"),
+               pname=_escape(pname), tdur=_escape(tdur or "-"), tierbadge=tier_badge_html,
+               tierhint=_escape(package_service.TIER_LABEL.get(tier, pname)),
+               parents_block=parents_block, extra_event_block=extra_event_block,
+               color_block=(color_block % dict(color_hint=_escape(color_hint))) if color_block else "",
+               story_block=story_block, plat_block=plat_block,
                **{k: v(k) for k in ["couple_name", "groom_name", "bride_name", "groom_insta", "bride_insta",
                                     "akkad_date", "reception_date", "event_time", "venue_name",
-                                    "venue_address", "maps_url", "whatsapp", "message"]})
-    return web.Response(text=client_page("Isi Data Undangan", 4, body), content_type="text/html")
+                                    "venue_address", "maps_url", "whatsapp", "message",
+                                    "groom_parents", "bride_parents", "quote_promise", "couple_story",
+                                    "theme_color", "ngunduh_date", "ngunduh_detail", "party_event",
+                                    "custom_request", "custom_reference"]})
+    return web.Response(text=client_page("Isi Data Undangan", 4, body,
+                                         extra_head="<style>%s</style>" % package_service.TIER_CSS),
+                        content_type="text/html")
 
 async def handle_preview(request):
     """[5] Preview — render template dengan data yang baru diisi (+ upload foto)."""
@@ -843,16 +1004,22 @@ async def handle_preview(request):
         errors.append("Nomor WhatsApp tidak valid (contoh: 08123456789).")
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute('SELECT t.id, t.name, t.price, t.duration, t.html_code, p.id, p.name, p.duration '
+    cur.execute('SELECT t.id, t.name, t.price, t.duration, t.html_code, p.id, p.name, p.duration, p.subtitle '
                 'FROM templates t JOIN packages p ON t.package_id = p.id WHERE t.id = ?', (tmpl_id,))
     tmpl = cur.fetchone()
+    # PLATINUM VIP: request custom adalah syarat pesanan (posisi: "Lo punya request? Kita bikinin.")
+    if tmpl:
+        _tier_chk = package_service.tier_of_package((tmpl[5], tmpl[6], tmpl[8]))
+        if _tier_chk == "platinum" and not (data.get("custom_request") or "").strip():
+            errors.append("Paket Platinum VIP mewajibkan Request Tema / Design Khusus diisi.")
     if errors or not tmpl:
         conn.close()
         qs = urlquote("&".join("%s=%s" % (k, urlquote(str(val))) for k, val in data.items()))
         msg = " | ".join(errors) if errors else "Template tidak ditemukan."
         raise web.HTTPFound("/form?template_id=%s&error=%s&%s" % (urlquote(str(tmpl_id)), urlquote(msg), qs))
 
-    _, tname, tprice, tdur, html_code, pid, pname, _pkgdur = tmpl
+    _, tname, tprice, tdur, html_code, pid, pname, _pkgdur, psub = tmpl
+    tier = package_service.tier_of_package((pid, pname, psub)) or "silver"
     # upload foto cover (validasi sama seperti file manager admin)
     photo_url = ""
     reader = request.content_type.startswith("multipart") and await request.multipart() or None
@@ -891,6 +1058,9 @@ async def handle_preview(request):
             field = await reader.next()
 
     o = {
+        "id": None,  # belum ada order; engine V1 pakai fallback mapping di bawah
+        "template_id": tmpl_id,
+        "_use_engine": True,   # preview client memakai RENDERER YANG SAMA dengan generator
         "couple_name": couple,
         "groom_name": data.get("groom_name", ""), "bride_name": data.get("bride_name", ""),
         "groom_insta": data.get("groom_insta", ""), "bride_insta": data.get("bride_insta", ""),
@@ -900,10 +1070,18 @@ async def handle_preview(request):
         "maps_url": data.get("maps_url", ""), "photo_url": photo_url,
         "whatsapp": data.get("whatsapp", ""), "message": data.get("message", ""),
         "code": "(belum dibuat)", "slug": slugify(couple) or "undangan",
+        # field baru per tier (lihat EXTRA_TOKENS & _build_wedding_data)
+        "groom_parents": data.get("groom_parents", ""), "bride_parents": data.get("bride_parents", ""),
+        "quote_promise": data.get("quote_promise", ""), "couple_story": data.get("couple_story", ""),
+        "theme_color": data.get("theme_color", ""), "ngunduh_date": data.get("ngunduh_date", ""),
+        "ngunduh_detail": data.get("ngunduh_detail", ""), "party_event": data.get("party_event", ""),
+        "custom_request": data.get("custom_request", ""), "custom_reference": data.get("custom_reference", ""),
+        "_tier": tier,
     }
     rendered = render_invitation_html(html_code, o)
     preview_frame = """
     <div class="section-title">Langkah 5 &mdash; Preview</div>
+    %(tierbar)s
     <div class="order-card" style="padding:12px;">
       <h3 style="margin-bottom:6px;">Begini tampilan undanganmu 🎀</h3>
       <p style="font-size:11px;color:#a1a1aa;margin-bottom:10px;">Template: <b style="color:#fff;">%(tname)s</b> &bull; %(tprice)s. Cek detail di bawah, lalu lanjut kirim pesanan.</p>
@@ -917,14 +1095,20 @@ async def handle_preview(request):
       <p style="font-size:10px;color:#71717a;margin-top:8px;">Dengan mengirim pesanan Anda setuju melanjutkan ke tahap pembayaran sesuai nominal yang tertera.</p>
     </form>
     """ % dict(tname=_escape(tname), tprice=_escape(tprice), srcdoc=_escape(rendered),
+               tierbar=_tier_summary_bar(tier, data),
                fields="".join('<input type="hidden" name="%s" value="%s">' % (k, _escape(v))
                               for k, v in [("template_id", tmpl_id), ("photo_url", photo_url)] +
                               [(f, data.get(f, "")) for f in
                                ["couple_name", "groom_name", "bride_name", "groom_insta", "bride_insta",
                                 "akkad_date", "reception_date", "event_time", "venue_name",
-                                "venue_address", "maps_url", "whatsapp", "message"]]))
+                                "venue_address", "maps_url", "whatsapp", "message",
+                                "groom_parents", "bride_parents", "quote_promise", "couple_story",
+                                "theme_color", "ngunduh_date", "ngunduh_detail", "party_event",
+                                "custom_request", "custom_reference"]]))
     conn.close()
-    return web.Response(text=client_page("Preview Undangan", 5, preview_frame), content_type="text/html")
+    return web.Response(text=client_page("Preview Undangan", 5, preview_frame,
+                                         extra_head="<style>%s</style>" % package_service.TIER_CSS),
+                        content_type="text/html")
 
 async def handle_submit_order(request):
     """[6] Kirim Pesanan -> Order dibuat (kode unik + slug subdomain) -> [7] Pembayaran."""
@@ -935,12 +1119,18 @@ async def handle_submit_order(request):
         raise web.HTTPFound("/start")
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute('SELECT t.price, t.duration, p.id, p.name FROM templates t JOIN packages p ON t.package_id=p.id WHERE t.id=?', (tmpl_id,))
+    cur.execute('SELECT t.price, t.duration, p.id, p.name, p.subtitle FROM templates t JOIN packages p ON t.package_id=p.id WHERE t.id=?', (tmpl_id,))
     row = cur.fetchone()
     if not row:
         conn.close()
         raise web.HTTPFound("/start")
-    tprice, tdur, pid, pname = row
+    tprice, tdur, pid, pname, psub = row
+    tier = package_service.tier_of_package((pid, pname, psub)) or "silver"
+    # PLATINUM VIP server-side guard: request custom wajib ada.
+    if tier == "platinum" and not (data.get("custom_request") or "").strip():
+        conn.close()
+        raise web.HTTPFound("/form?template_id=%s&error=%s" % (urlquote(str(tmpl_id)),
+                    urlquote("Paket Platinum VIP mewajibkan Request Tema / Design Khusus diisi.")))
     slug = unique_slug(cur, slugify(couple))
     # kode unik + anti duplikat
     while True:
@@ -949,16 +1139,35 @@ async def handle_submit_order(request):
             break
     cur.execute('''INSERT INTO orders (code, slug, template_id, package_id, couple_name, groom_name, bride_name,
                  groom_insta, bride_insta, event_date, event_time, akkad_date, reception_date, venue_name,
-                 venue_address, maps_url, photo_url, whatsapp, message, status, amount)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending_payment',?)''',
+                 venue_address, maps_url, photo_url, whatsapp, message, status, amount, notes)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending_payment',?,?)''',
                 (code, slug, tmpl_id, pid, couple, data.get("groom_name", ""), data.get("bride_name", ""),
                  data.get("groom_insta", ""), data.get("bride_insta", ""), data.get("reception_date", ""),
                  data.get("event_time", ""), data.get("akkad_date", ""), data.get("reception_date", ""),
                  data.get("venue_name", ""), data.get("venue_address", ""), data.get("maps_url", ""),
-                 data.get("photo_url", ""), data.get("whatsapp", ""), data.get("message", ""), tprice))
+                 data.get("photo_url", ""), data.get("whatsapp", ""), data.get("message", ""), tprice,
+                 _build_tier_notes(tier, data)))
     oid = cur.lastrowid
     add_order_event(cur, oid, "pending_payment", "Pesanan dibuat oleh client")
-    conn.commit()
+    if tier == "platinum":
+        add_order_event(cur, oid, "pending_payment",
+                        "PLATINUM REQUEST: " + (data.get("custom_request") or "")[:400])
+    # ---- Template Engine V1 (additive): wedding draft + payment state ----
+    try:
+        conn_v1 = conn  # pakai koneksi yang sama sebelum commit
+        template_service.ensure_payment_state(conn_v1, oid, tprice)
+        w = wedding_service.get_wedding_by_order(conn_v1, oid)
+        if w is None:
+            wedding_service.create_wedding(
+                conn_v1, oid,
+                groom_name=data.get("groom_name", ""), bride_name=data.get("bride_name", ""),
+                event_date=data.get("reception_date", ""), event_time=data.get("event_time", ""),
+                venue=data.get("venue_name", ""), address=data.get("venue_address", ""),
+                couple_photo=data.get("photo_url", ""), message=data.get("message", ""),
+                **wedding_service.extra_field_kwargs(data))
+        conn.commit()
+    except Exception as _e:
+        print("[v1] wedding/payment_state backfill gagal (order legacy tetap dibuat):", _e)
     conn.close()
     raise web.HTTPFound("/payment?code=" + urlquote(code))
 
@@ -1175,9 +1384,17 @@ async def handle_invite_subdomain(request):
     html_out = None
     if o:
         if o["status"] in ("active",):
-            cur.execute("SELECT html_code FROM templates WHERE id = ?", (o["template_id"],))
-            trow = cur.fetchone()
-            html_out = render_invitation_html(trow[0] if trow else "", o)
+            # Prioritas 1: hasil GENERATED (index.html) dari Template Engine V1.
+            gen_index = os.path.join(GENERATED_ROOT, slug, "index.html")
+            if os.path.isfile(gen_index):
+                with open(gen_index, "r", encoding="utf-8") as f:
+                    html_out = f.read()
+            else:
+                # jalur lama tetap berfungsi untuk order legacy existing
+                o["_use_engine"] = True   # placeholder template dirender via engine V1
+                cur.execute("SELECT html_code FROM templates WHERE id = ?", (o["template_id"],))
+                trow = cur.fetchone()
+                html_out = render_invitation_html(trow[0] if trow else "", o)
         elif o["status"] == "expired":
             html_out = _closed_page(o["couple_name"], "Masa aktif undangan ini sudah berakhir (EXPIRED).", o)
         else:
