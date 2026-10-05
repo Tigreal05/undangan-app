@@ -12,9 +12,21 @@ from urllib.parse import quote as urlquote
 import aiohttp
 from aiohttp import web
 
+# --- Template Engine V1 (additive): renderer/ + services/ ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in os.sys.path:
+    os.sys.path.insert(0, BASE_DIR)
+from renderer import renderer as engine  # noqa: E402  (dispatch render_template/load_template)
+from renderer.validator import validate_template, validate_photo_value  # noqa: E402
+from services import wedding_service, order_service, generation_service, template_service  # noqa: E402
+
 DB_NAME = "undangan.db"
 UPLOAD_DIR = "./static_uploads"
 HOMEPAGE_FILE = "homepage.html"
+PROOF_DIR = os.path.join(BASE_DIR, "payment_proofs")  # privat: TIDAK dipublik via static route
+GENERATED_ROOT = os.path.join(BASE_DIR, "generated", "weddings")
+os.makedirs(PROOF_DIR, exist_ok=True)
+os.makedirs(GENERATED_ROOT, exist_ok=True)
 
 # ============================================================
 # S0 SECURITY: konfigurasi via environment variable
@@ -282,6 +294,23 @@ def init_db():
         cursor.execute("ALTER TABLE templates ADD COLUMN duration TEXT DEFAULT ''")
     if 'is_top10' not in columns:
         cursor.execute("ALTER TABLE templates ADD COLUMN is_top10 INTEGER DEFAULT 0")
+    # ---- Template Engine V1: migrasi ADDITIVE (jangan hapus kolom lama) ----
+    # render_mode: 'legacy' (template lama) | 'placeholder' (template baru dgn {{key}})
+    # template_path boleh NULL selama html_code masih source of truth.
+    if 'render_mode' not in columns:
+        cursor.execute("ALTER TABLE templates ADD COLUMN render_mode TEXT NOT NULL DEFAULT 'legacy'")
+    if 'template_key' not in columns:
+        cursor.execute("ALTER TABLE templates ADD COLUMN template_key TEXT")
+    if 'template_path' not in columns:
+        cursor.execute("ALTER TABLE templates ADD COLUMN template_path TEXT")
+    if 'status' not in columns:
+        cursor.execute("ALTER TABLE templates ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    cursor.close()
+    conn.close()
+    # weddings + payment_state (tabel baru, additive; idempoten)
+    template_service.migrate_additive(DB_NAME)
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
 
     cursor.execute('SELECT COUNT(*) FROM packages')
     if cursor.fetchone()[0] == 0:
@@ -475,10 +504,39 @@ def format_date_id(iso):
 
 def render_invitation_html(html_code, o):
     """Injeksi data undangan ke dalam html_code template.
-    Mendukung 2 gaya:
+
+    LEGACY (flow lama /preview & /u/{slug}): mendukung 2 gaya:
       1) token {{nama_field}} di dalam HTML template
       2) atribut data-field="nama_field" pada elemen (untuk template lama contenteditable)
+
+    ENGINE V1: bila ada pasangan wedding <-> order <-> template dengan
+    render_mode='placeholder', gunakan renderer kanonik (engine.render_template)
+    agar PREVIEW client == GENERATION production (one renderer).
     """
+    # --- jalur Template Engine V1 (additive; fallback ke perilaku lama) ---
+    try:
+        _tid = o.get("template_id")
+        if _tid is not None and o.get("_use_engine"):
+            _conn = sqlite3.connect(DB_NAME)
+            try:
+                _tmpl = engine.load_template(_conn, _tid)
+                if _tmpl and (_tmpl.get("render_mode") or "legacy") == "placeholder":
+                    _w = wedding_service.get_wedding_by_order(_conn, o["id"]) if o.get("id") else None
+                    if _w is None:
+                        _w = {
+                            "groom_name": o.get("groom_name", ""), "bride_name": o.get("bride_name", ""),
+                            "event_date": o.get("event_date", ""), "event_time": o.get("event_time", ""),
+                            "venue": o.get("venue_name", ""), "address": o.get("venue_address", ""),
+                            "couple_photo": o.get("photo_url", ""),
+                        }
+                    return engine.render_template(_tmpl, wedding_service.to_renderer_data(_w))
+            finally:
+                _conn.close()
+    except engine.RenderError:
+        raise
+    except Exception as _e:  # jangan jatuhkan flow lama karena error engine
+        print("[renderer-v1] fallback legacy render:", _e)
+
     tokens = {
         "couple_name": o["couple_name"],
         "groom_name": o["groom_name"],
@@ -891,6 +949,9 @@ async def handle_preview(request):
             field = await reader.next()
 
     o = {
+        "id": None,  # belum ada order; engine V1 pakai fallback mapping di bawah
+        "template_id": tmpl_id,
+        "_use_engine": True,   # preview client memakai RENDERER YANG SAMA dengan generator
         "couple_name": couple,
         "groom_name": data.get("groom_name", ""), "bride_name": data.get("bride_name", ""),
         "groom_insta": data.get("groom_insta", ""), "bride_insta": data.get("bride_insta", ""),
@@ -958,7 +1019,21 @@ async def handle_submit_order(request):
                  data.get("photo_url", ""), data.get("whatsapp", ""), data.get("message", ""), tprice))
     oid = cur.lastrowid
     add_order_event(cur, oid, "pending_payment", "Pesanan dibuat oleh client")
-    conn.commit()
+    # ---- Template Engine V1 (additive): wedding draft + payment state ----
+    try:
+        conn_v1 = conn  # pakai koneksi yang sama sebelum commit
+        template_service.ensure_payment_state(conn_v1, oid, tprice)
+        w = wedding_service.get_wedding_by_order(conn_v1, oid)
+        if w is None:
+            wedding_service.create_wedding(
+                conn_v1, oid,
+                groom_name=data.get("groom_name", ""), bride_name=data.get("bride_name", ""),
+                event_date=data.get("reception_date", ""), event_time=data.get("event_time", ""),
+                venue=data.get("venue_name", ""), address=data.get("venue_address", ""),
+                couple_photo=data.get("photo_url", ""), message=data.get("message", ""))
+        conn.commit()
+    except Exception as _e:
+        print("[v1] wedding/payment_state backfill gagal (order legacy tetap dibuat):", _e)
     conn.close()
     raise web.HTTPFound("/payment?code=" + urlquote(code))
 
@@ -1175,9 +1250,17 @@ async def handle_invite_subdomain(request):
     html_out = None
     if o:
         if o["status"] in ("active",):
-            cur.execute("SELECT html_code FROM templates WHERE id = ?", (o["template_id"],))
-            trow = cur.fetchone()
-            html_out = render_invitation_html(trow[0] if trow else "", o)
+            # Prioritas 1: hasil GENERATED (index.html) dari Template Engine V1.
+            gen_index = os.path.join(GENERATED_ROOT, slug, "index.html")
+            if os.path.isfile(gen_index):
+                with open(gen_index, "r", encoding="utf-8") as f:
+                    html_out = f.read()
+            else:
+                # jalur lama tetap berfungsi untuk order legacy existing
+                o["_use_engine"] = True   # placeholder template dirender via engine V1
+                cur.execute("SELECT html_code FROM templates WHERE id = ?", (o["template_id"],))
+                trow = cur.fetchone()
+                html_out = render_invitation_html(trow[0] if trow else "", o)
         elif o["status"] == "expired":
             html_out = _closed_page(o["couple_name"], "Masa aktif undangan ini sudah berakhir (EXPIRED).", o)
         else:
